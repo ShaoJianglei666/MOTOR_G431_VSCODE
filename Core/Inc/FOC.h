@@ -81,6 +81,22 @@ extern "C" {
 /** @brief 机械转速对应的相反电势峰值 pu */
 #define FOC_BEMF_PU_PER_RPM         ((MOTOR_BEMF_CONST_V_LL / FOC_SQRT3) \
                                      / (1000.0f * FOC_BASE_VOLTAGE_V))
+/** @brief 定子电感离散项: Ls * Ibase / (Vbase * Ts) */
+#define FOC_LS_OVER_TS_PU           (MOTOR_PHASE_INDUCTANCE * FOC_BASE_CURRENT_A \
+                                     / (FOC_BASE_VOLTAGE_V * FOC_CTRL_TS))
+
+/*--- 龙伯格观测器/PLL 诊断参数（只观测，不参与控制） ---*/
+#define FOC_OBS_MAX_SPEED_RPM       3000.0f
+#define FOC_OBS_MAX_OMEGA_ELEC      (FOC_OBS_MAX_SPEED_RPM * FOC_2PI \
+                                     * (float)MOTOR_POLE_PAIRS / 60.0f)
+#define FOC_OBS_LPF_GAIN            0.03125f
+#define FOC_OBS_PLL_KP              0.08f
+#define FOC_OBS_PLL_KI              0.002f
+#define FOC_OBS_PLL_SPEED_BLEND     0.002f
+#define FOC_OBS_PLL_ERR_MAX         0.125f
+#define FOC_OBS_LOCK_BEMF_SQ_THR    0.0010f
+#define FOC_OBS_LOCK_SPEED_RPM      100.0f
+#define FOC_ELEC_OMEGA_TO_RPM       (60.0f / (FOC_2PI * (float)MOTOR_POLE_PAIRS))
 
 /*--- PI 电流环增益（小电流电机降低增益防振荡） ---*/
 #define FOC_PI_ID_KP                0.05f
@@ -150,12 +166,27 @@ typedef struct
     float fOutMin;
 } FOC_PI;
 
+/**
+  * @brief 龙伯格反电势观测器状态（旁路诊断，不参与开环控制）
+  */
+typedef struct
+{
+    float    f32Ealpha;       /**< α轴反电势估计 (pu) */
+    float    f32Ebeta;        /**< β轴反电势估计 (pu) */
+    float    f32ThetaObs;     /**< 观测电角度 (rad) */
+    float    f32SpeedObs;     /**< 观测机械转速 (RPM) */
+    float    f32ErrPll;       /**< PLL 误差 */
+    float    f32BemfMag;      /**< BEMF 幅值近似 (pu) */
+    uint16_t u16Locked;       /**< 锁定标志 */
+} FOC_Luenberger;
+
 /* Exported variables --------------------------------------------------------*/
 
 extern FOC_MotorState    g_stMotor;
 extern FOC_ControlState  g_stCtrl;
 extern FOC_PI            g_stPiId;
 extern FOC_PI            g_stPiIq;
+extern FOC_Luenberger    g_stLuenberger;
 extern float             FOC_fIaOffsetAdc;
 extern float             FOC_fIbOffsetAdc;
 extern const float       FOC_SinTable_F32[FOC_SIN_TABLE_SIZE];
@@ -165,6 +196,8 @@ extern const float       FOC_SinTable_F32[FOC_SIN_TABLE_SIZE];
 void  FOC_Init(void);
 void  FOC_ControlStep(void);
 void  FOC_GetPhaseCurrent(void);
+void  FOC_Luenberger_Init(void);
+void  FOC_Luenberger_Run(void);
 
 void  FOC_Svpwm(float fValpha, float fVbeta,
                 uint16_t *pu16Ta, uint16_t *pu16Tb, uint16_t *pu16Tc);

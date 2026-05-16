@@ -180,10 +180,25 @@ static int VOFA_AppendMilli(char *buf, int pos, int size, float value)
                           (long)(abs_scaled % 1000));
 }
 
+static float VOFA_RadToDeg(float rad)
+{
+    return rad * 57.2957795f;
+}
+
+static float VOFA_WrapDeg180(float deg)
+{
+    while (deg >= 180.0f) deg -= 360.0f;
+    while (deg < -180.0f) deg += 360.0f;
+    return deg;
+}
+
 static void VOFA_SendTelemetry(void)
 {
-    char buf[128];
+    char buf[224];
     int pos = 0;
+    float theta_open_deg = VOFA_RadToDeg(g_stMotor.f32Theta);
+    float theta_obs_deg = VOFA_RadToDeg(g_stLuenberger.f32ThetaObs);
+    float theta_err_deg = VOFA_WrapDeg180(theta_obs_deg - theta_open_deg);
 
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "foc:");
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32TargetRpm);
@@ -197,6 +212,12 @@ static void VOFA_SendTelemetry(void)
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Id);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Iq);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_open_deg);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_obs_deg);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_err_deg);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "\n");
 
     if ((pos > 0) && (pos < (int)sizeof(buf)))
@@ -302,10 +323,10 @@ int main(void)
         }
     }
 
-    /*--- VOFA FireWater telemetry, 5Hz ---*/
+    /*--- VOFA FireWater telemetry, 500Hz ---*/
     {
         static uint32_t s_u32VofaTick = 0;
-        if (HAL_GetTick() - s_u32VofaTick >= 200U)
+        if (HAL_GetTick() - s_u32VofaTick >= 2U)
         {
             s_u32VofaTick = HAL_GetTick();
             VOFA_SendTelemetry();

@@ -110,8 +110,13 @@ FOC_MotorState   g_stMotor;
 FOC_ControlState g_stCtrl;
 FOC_PI           g_stPiId;
 FOC_PI           g_stPiIq;
+FOC_Luenberger   g_stLuenberger;
 float            FOC_fIaOffsetAdc = 1972.0f;
 float            FOC_fIbOffsetAdc = 1972.0f;
+
+static float s_fObsIalphaPrev = 0.0f;
+static float s_fObsIbetaPrev  = 0.0f;
+static float s_fObsOmegaElec  = 0.0f;
 
 /*============================================================================*/
 /* SVPWM — 共模注入法                                                          */
@@ -211,6 +216,7 @@ void FOC_Init(void)
 
     g_stCtrl.eMode        = FOC_MODE_STOP;
     g_stCtrl.f32TargetRpm = 0.0f;
+    FOC_Luenberger_Init();
 
     /* Id PI */
     g_stPiId.fKp       = FOC_PI_ID_KP;
@@ -307,6 +313,87 @@ static void FOC_StateMachine_Run(void)
 }
 
 /*============================================================================*/
+/* 龙伯格反电势观测器 — 旁路诊断，不参与开环角度/电压控制                     */
+/*============================================================================*/
+void FOC_Luenberger_Init(void)
+{
+    memset(&g_stLuenberger, 0, sizeof(g_stLuenberger));
+    s_fObsIalphaPrev = 0.0f;
+    s_fObsIbetaPrev  = 0.0f;
+    s_fObsOmegaElec  = 0.0f;
+}
+
+void FOC_Luenberger_Run(void)
+{
+    float fOmegaOpen;
+    float fDiAlpha;
+    float fDiBeta;
+    float fEalpha;
+    float fEbeta;
+    float fSin;
+    float fCos;
+    float fErr;
+    float fMagSq;
+
+    fDiAlpha = g_stMotor.f32Ialpha - s_fObsIalphaPrev;
+    fDiBeta  = g_stMotor.f32Ibeta  - s_fObsIbetaPrev;
+    s_fObsIalphaPrev = g_stMotor.f32Ialpha;
+    s_fObsIbetaPrev  = g_stMotor.f32Ibeta;
+
+    fEalpha = g_stMotor.f32Valpha
+            - FOC_RS_PU * g_stMotor.f32Ialpha
+            - FOC_LS_OVER_TS_PU * fDiAlpha;
+    fEbeta  = g_stMotor.f32Vbeta
+            - FOC_RS_PU * g_stMotor.f32Ibeta
+            - FOC_LS_OVER_TS_PU * fDiBeta;
+
+    fEalpha = g_stLuenberger.f32Ealpha
+            + FOC_OBS_LPF_GAIN * (fEalpha - g_stLuenberger.f32Ealpha);
+    fEbeta  = g_stLuenberger.f32Ebeta
+            + FOC_OBS_LPF_GAIN * (fEbeta - g_stLuenberger.f32Ebeta);
+
+    g_stLuenberger.f32Ealpha = fclamp(fEalpha, -0.98f, 0.98f);
+    g_stLuenberger.f32Ebeta  = fclamp(fEbeta,  -0.98f, 0.98f);
+
+    f32_sincos_lut(g_stLuenberger.f32ThetaObs, &fSin, &fCos);
+    fErr = -g_stLuenberger.f32Ealpha * fCos
+           -g_stLuenberger.f32Ebeta  * fSin;
+    fErr = fclamp(fErr, -FOC_OBS_PLL_ERR_MAX, FOC_OBS_PLL_ERR_MAX);
+
+    fOmegaOpen = g_stCtrl.f32RpmRamp * FOC_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
+    fOmegaOpen = fclamp(fOmegaOpen, 0.0f, FOC_OBS_MAX_OMEGA_ELEC);
+
+    s_fObsOmegaElec += FOC_OBS_PLL_SPEED_BLEND * (fOmegaOpen - s_fObsOmegaElec)
+                     + FOC_OBS_PLL_KI * fErr;
+    s_fObsOmegaElec = fclamp(s_fObsOmegaElec, 0.0f, FOC_OBS_MAX_OMEGA_ELEC);
+
+    g_stLuenberger.f32ThetaObs = fwrap_2pi(g_stLuenberger.f32ThetaObs
+                                        + s_fObsOmegaElec * FOC_CTRL_TS
+                                        + FOC_OBS_PLL_KP * fErr);
+    g_stLuenberger.f32SpeedObs = s_fObsOmegaElec * FOC_ELEC_OMEGA_TO_RPM;
+    g_stLuenberger.f32ErrPll   = fErr;
+
+    {
+        float a = g_stLuenberger.f32Ealpha;
+        float b = g_stLuenberger.f32Ebeta;
+        if (a < 0.0f) a = -a;
+        if (b < 0.0f) b = -b;
+        if (a < b)
+        {
+            float t = a;
+            a = b;
+            b = t;
+        }
+        g_stLuenberger.f32BemfMag = a + 0.5f * b;
+    }
+
+    fMagSq = g_stLuenberger.f32Ealpha * g_stLuenberger.f32Ealpha
+           + g_stLuenberger.f32Ebeta  * g_stLuenberger.f32Ebeta;
+    g_stLuenberger.u16Locked = ((fMagSq > FOC_OBS_LOCK_BEMF_SQ_THR) &&
+                                (g_stLuenberger.f32SpeedObs > FOC_OBS_LOCK_SPEED_RPM)) ? 1U : 0U;
+}
+
+/*============================================================================*/
 /* FOC 控制步进 — 10kHz ADC 中断中调用                                         */
 /*============================================================================*/
 void FOC_ControlStep(void)
@@ -353,6 +440,9 @@ void FOC_ControlStep(void)
     FOC_InvPark(g_stMotor.f32UdRef, g_stMotor.f32UqRef,
                 g_stMotor.f32Theta,
                 &g_stMotor.f32Valpha, &g_stMotor.f32Vbeta);
+
+    /*--- 旁路观测器：只更新观测角度，不参与控制 ---*/
+    FOC_Luenberger_Run();
 
     /*--- 第5步：SVPWM ---*/
     FOC_Svpwm(g_stMotor.f32Valpha, g_stMotor.f32Vbeta,
