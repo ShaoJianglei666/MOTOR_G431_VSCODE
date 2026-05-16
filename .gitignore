@@ -1,0 +1,23 @@
+# Build output
+build/
+build*/
+
+# Keil MDK artifacts
+MDK-ARM/*.lst
+MDK-ARM/*.d
+MDK-ARM/*.crf
+MDK-ARM/*.o
+MDK-ARM/*.axf
+MDK-ARM/*.hex
+MDK-ARM/*.bin
+MDK-ARM/JLinkLog.txt
+MDK-ARM/*.dep
+MDK-ARM/*.iex
+MDK-ARM/*.uvguix.*
+MDK-ARM/sto_st_ctrl/
+
+# CubeMX scratch
+mx.scratch
+
+# IDE
+!.settings
