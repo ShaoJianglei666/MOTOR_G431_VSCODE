@@ -57,32 +57,11 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   // HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PC2 PC3 PC6 */
+  /*Configure GPIO pin : PC8 */
   GPIO_InitStruct.Pin = KEY_RUN_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(KEY_RUN_PORT, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = KEY_STOP_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(KEY_STOP_PORT, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = KEY_UP_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(KEY_UP_PORT, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = KEY_DOWN_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(KEY_DOWN_PORT, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = KEY_DIR_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(KEY_DIR_PORT, &GPIO_InitStruct);
-
 
   /*Configure GPIO pin : PB12 */
   GPIO_InitStruct.Pin = LED_PIN;

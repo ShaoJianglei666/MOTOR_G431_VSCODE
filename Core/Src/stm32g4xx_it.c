@@ -29,11 +29,7 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
-uint8_t Uart3_Rx_Buf[64];
-uint8_t Uart3_Tx_Buf[64];
-uint8_t Uart3_Rx_Data_Len = 0;
-uint8_t Uart3_Tx_Data_Len = 0;
-uint8_t Uart3_Rx_F = 0;
+
 /* USER CODE END TD */
 
 /* Private define ------------------------------------------------------------*/
@@ -219,6 +215,25 @@ void SysTick_Handler(void)
 void ADC1_2_IRQHandler(void)
 {
   /* USER CODE BEGIN ADC1_2_IRQn 0 */
+  uint32_t wait;
+
+  for (wait = 0U; wait < 64U; wait++)
+  {
+    if (((ADC1->ISR & ADC_ISR_JEOC) != 0U) &&
+        ((ADC2->ISR & ADC_ISR_JEOC) != 0U))
+    {
+      break;
+    }
+  }
+
+  if (((ADC1->ISR & ADC_ISR_JEOC) == 0U) ||
+      ((ADC2->ISR & ADC_ISR_JEOC) == 0U))
+  {
+    ADC1->ISR = ADC_ISR_JEOC | ADC_ISR_JEOS;
+    ADC2->ISR = ADC_ISR_JEOC | ADC_ISR_JEOS;
+    return;
+  }
+
 	/*
 	 * 等效 STM32F103: ADC1->SR &= ~(ADC_SR_JEOC | ADC_SR_JSTRT);
 	 *

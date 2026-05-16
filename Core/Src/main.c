@@ -2,17 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @brief          : Main program body — IF 开环精简版
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -27,14 +17,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-/** @brief IF 开环调试模式：注释此行恢复完整的 Imperix 五阶段闭环 */
-#define FOC_IF_OPENLOOP_DEBUG
-
-extern uint8_t Uart3_Rx_F;
-extern uint8_t Uart3_Rx_Data_Len;
-extern uint8_t Uart3_Rx_Buf[];
-
 #include "FOC.h"
+#include "key.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,18 +29,7 @@ extern uint8_t Uart3_Rx_Buf[];
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// #define FOC_DEBUG_TEST 0
-
-
-
-/* 按键消抖时间 (ms) — 无硬件电容，适当加大 */
-#define KEY_DEBOUNCE_MS     50
-
-/* 速度调节参数 */
-#define SPEED_RUN           1500    /* 按 RUN 的目标转速 */
-#define SPEED_MIN           300     /* DOWN 下限 */
-#define SPEED_MAX           3000    /* UP 上限 */
-#define SPEED_STEP          100     /* UP/DOWN 步长 */
+#define SPEED_RUN  1200    /* 目标转速 (RPM) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,134 +40,170 @@ extern uint8_t Uart3_Rx_Buf[];
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-#ifdef FOC_DEBUG_TEST
-/* 按键消抖状态：1=检测到一次有效按下（待处理），由主循环清0 */
-static uint8_t s_u8KeyRunPressed   = 0;
-static uint8_t s_u8KeyStopPressed  = 0;
-static uint8_t s_u8KeyUpPressed    = 0;
-static uint8_t s_u8KeyDownPressed  = 0;
-#endif
+static uint8_t s_u8MotorRunning = 0;   /* 电机运行标志: 0=停止, 1=运行 */
 /* USER CODE END PV */
-
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void UART3_ProcessReceivedData(void);
+static void Motor_Start(void);
+static void Motor_Stop(void);
+static uint16_t ADC_InjectedReadOnce(ADC_HandleTypeDef *hadc);
+static void VOFA_SendTelemetry(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#ifdef FOC_DEBUG_TEST
 
 /**
-  * @brief  FOC 状态发送任务（主循环中调用，浮点版）
+  * @brief  启动电机：开启 PWM + ADC 中断 + 设定目标转速
   */
-static void FOC_State_Send(void)
+static void Motor_Start(void)
 {
-    static const uint32_t JUSTFLOAT_TAIL = 0x7F800000UL;
-    float fSendBuf[14];
+    if (s_u8MotorRunning) return;
+    s_u8MotorRunning = 1;
 
-    fSendBuf[0]  = g_stMotor.f32Theta;                /* 电角度 θ (rad) */
-    fSendBuf[1]  = g_stMotor.f32Id;                   /* Id (pu) */
-    fSendBuf[2]  = g_stMotor.f32Iq;                   /* Iq (pu) */
-    fSendBuf[3]  = g_stCtrl.f32IdRef;                 /* Id_ref (pu) */
-    fSendBuf[4]  = g_stCtrl.f32IqRef;                 /* Iq_ref (pu) */
-#ifdef FOC_IF_OPENLOOP_DEBUG
-    fSendBuf[5]  = g_stMotor.f32Theta;                /* IF开环: θ 参考 (rad) */
-    fSendBuf[6]  = g_stCtrl.f32RpmRamp;               /* IF开环: 斜坡转速 (RPM) */
-#else
-    fSendBuf[5]  = g_stLuenberger.f32ThetaObs;        /* θ̂ (rad) */
-    fSendBuf[6]  = g_stLuenberger.f32SpeedObs;        /* 转速 (RPM) */
-#endif
-    fSendBuf[7]  = (float)(int32_t)g_stCtrl.eMode;    /* 模式 */
-    fSendBuf[8]  = g_stCtrl.f32TorqueAngle * 57.29578f; /* 转矩角 (°) */
-    fSendBuf[9]  = (float)g_stCtrl.u16BlendCount;     /* 过渡计数 */
-    fSendBuf[10] = (float)g_stCtrl.u16DiagTransitionFlag; /* 过渡标志 */
-    fSendBuf[11] = g_stPiSpeed.fIntegral;             /* 速度PI积分(I) (pu) */
-    fSendBuf[12] = g_stCtrl.f32ThetaErrSave;          /* 速度PI比例(P) (pu) */
+    FOC_Init();
 
-    *(uint32_t *)&fSendBuf[13] = JUSTFLOAT_TAIL;
-    HAL_UART_Transmit(&huart3, (uint8_t *)fSendBuf, 56, 50);
+    /* 上桥前先给三相 50% 占空比，避免 PWM 刚启动时沿用 CCR=0。 */
+    TIM1->CCR1 = PWM_HALF_CYCLE;
+    TIM1->CCR2 = PWM_HALF_CYCLE;
+    TIM1->CCR3 = PWM_HALF_CYCLE;
+    TIM1->CNT  = 0;
+    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+
+    /* 启动 TIM1 六路 PWM */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+
+    /* 启动 ADC 注入组（TIM1_CH4 硬件触发） */
+    HAL_ADCEx_InjectedStart_IT(&hadc1);
+    HAL_ADCEx_InjectedStart_IT(&hadc2);
+
+    /* 使能 TIM1 更新中断（10kHz FOC 控制环） */
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+
+    /* 设定目标转速 → 状态机自动进入 IF 开环 */
+    g_stCtrl.f32TargetRpm = (float)SPEED_RUN;
 }
-
-#endif /* FOC_DEBUG_TEST */
-
-
-#ifdef FOC_DEBUG_TEST
 
 /**
-  * @brief  按键扫描（软件消抖，防按键抖动和误触发）
-  *         检测下降沿（高→低），连续低电平保持 KEY_DEBOUNCE_MS 后确认一次有效按下。
-  *         一旦释放，复位消抖状态，下次按下可再次触发。
-  * @note   每个按键单次按下仅触发一次，长按不重复触发。
+  * @brief  停止电机：关 PWM + 关中断 + 复位 FOC 状态
   */
-static void KEY_Scan(void)
+static void Motor_Stop(void)
 {
-    uint32_t u32Now = HAL_GetTick();
-    uint8_t  u8Val;
+    if (!s_u8MotorRunning) return;
+    s_u8MotorRunning = 0;
 
-    /*--- RUN (PA3) ---*/
-    {
-        static uint32_t s_u32Tick = 0;
-        static uint8_t  s_u8Last  = 1;
-        u8Val = (uint8_t)HAL_GPIO_ReadPin(KEY_RUN_PORT, KEY_RUN_PIN);
-        if (u8Val == 0) /* 按下 */
-        {
-            if (s_u8Last == 1) { s_u32Tick = u32Now; }                     /* 下降沿 */
-            else if ((u32Now - s_u32Tick) >= KEY_DEBOUNCE_MS && !s_u8KeyRunPressed)
-                { s_u8KeyRunPressed = 1; }                                 /* 消抖确认 */
-        }
-        s_u8Last = u8Val;
-    }
+    /* 先通知状态机停止 */
+    g_stCtrl.f32TargetRpm = 0.0f;
 
-    /*--- STOP (PA4) ---*/
-    {
-        static uint32_t s_u32Tick = 0;
-        static uint8_t  s_u8Last  = 1;
-        u8Val = (uint8_t)HAL_GPIO_ReadPin(KEY_STOP_PORT, KEY_STOP_PIN);
-        if (u8Val == 0)
-        {
-            if (s_u8Last == 1) { s_u32Tick = u32Now; }
-            else if ((u32Now - s_u32Tick) >= KEY_DEBOUNCE_MS && !s_u8KeyStopPressed)
-                { s_u8KeyStopPressed = 1; }
-        }
-        s_u8Last = u8Val;
-    }
+    /* 关闭 TIM1 更新中断 */
+    __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
 
-    /*--- UP (PA5) ---*/
-    {
-        static uint32_t s_u32Tick = 0;
-        static uint8_t  s_u8Last  = 1;
-        u8Val = (uint8_t)HAL_GPIO_ReadPin(KEY_UP_PORT, KEY_UP_PIN);
-        if (u8Val == 0)
-        {
-            if (s_u8Last == 1) { s_u32Tick = u32Now; }
-            else if ((u32Now - s_u32Tick) >= KEY_DEBOUNCE_MS && !s_u8KeyUpPressed)
-                { s_u8KeyUpPressed = 1; }
-        }
-        s_u8Last = u8Val;
-    }
+    TIM1->CCR1 = PWM_HALF_CYCLE;
+    TIM1->CCR2 = PWM_HALF_CYCLE;
+    TIM1->CCR3 = PWM_HALF_CYCLE;
 
-    /*--- DOWN (PB1) ---*/
-    {
-        static uint32_t s_u32Tick = 0;
-        static uint8_t  s_u8Last  = 1;
-        u8Val = (uint8_t)HAL_GPIO_ReadPin(KEY_DOWN_PORT, KEY_DOWN_PIN);
-        if (u8Val == 0)
-        {
-            if (s_u8Last == 1) { s_u32Tick = u32Now; }
-            else if ((u32Now - s_u32Tick) >= KEY_DEBOUNCE_MS && !s_u8KeyDownPressed)
-                { s_u8KeyDownPressed = 1; }
-        }
-        s_u8Last = u8Val;
-    }
+    /* 关闭 ADC 注入组中断 */
+    HAL_ADCEx_InjectedStop_IT(&hadc1);
+    HAL_ADCEx_InjectedStop_IT(&hadc2);
 
-    /*--- DIR (PB11)：暂不处理 ---*/
+    /* 关闭 TIM1 六路 PWM 输出 */
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
+
+    /* FOC 状态机复位 */
+    FOC_Init();
 }
 
-#endif /* FOC_DEBUG_TEST */
+static uint16_t ADC_InjectedReadOnce(ADC_HandleTypeDef *hadc)
+{
+    uint32_t saved_jsqr = hadc->Instance->JSQR;
+    uint16_t value;
 
+    hadc->Instance->JSQR &= ~ADC_JSQR_JEXTEN;
+    __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_JEOC | ADC_FLAG_JEOS);
+
+    if (HAL_ADCEx_InjectedStart(hadc) == HAL_OK)
+    {
+        if (HAL_ADCEx_InjectedPollForConversion(hadc, 10U) != HAL_OK)
+        {
+            Error_Handler();
+        }
+        value = (uint16_t)HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+        HAL_ADCEx_InjectedStop(hadc);
+    }
+    else
+    {
+        Error_Handler();
+        value = 0U;
+    }
+
+    hadc->Instance->JSQR = saved_jsqr;
+    return value;
+}
+
+static int32_t VOFA_FloatToMilli(float value)
+{
+    if (value >= 0.0f)
+    {
+        return (int32_t)(value * 1000.0f + 0.5f);
+    }
+
+    return (int32_t)(value * 1000.0f - 0.5f);
+}
+
+static int VOFA_AppendMilli(char *buf, int pos, int size, float value)
+{
+    int32_t scaled = VOFA_FloatToMilli(value);
+    int32_t abs_scaled = scaled;
+    const char *sign = "";
+
+    if (scaled < 0)
+    {
+        sign = "-";
+        abs_scaled = -scaled;
+    }
+
+    return pos + snprintf(&buf[pos], (size_t)(size - pos), "%s%ld.%03ld",
+                          sign,
+                          (long)(abs_scaled / 1000),
+                          (long)(abs_scaled % 1000));
+}
+
+static void VOFA_SendTelemetry(void)
+{
+    char buf[128];
+    int pos = 0;
+
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "foc:");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32TargetRpm);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32RpmRamp);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32IdRef);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32IqRef);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Id);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Iq);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "\n");
+
+    if ((pos > 0) && (pos < (int)sizeof(buf)))
+    {
+        HAL_UART_Transmit(&huart3, (uint8_t *)buf, (uint16_t)pos, 10U);
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -209,17 +219,11 @@ int main(void)
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -234,111 +238,78 @@ int main(void)
   MX_TIM1_Init();
   MX_DAC1_Init();
   MX_TIM2_Init();
-  MX_TIM3_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  HAL_OPAMP_Start(&hopamp1);
+  HAL_OPAMP_Start(&hopamp2);
+  HAL_OPAMP_Start(&hopamp3);
+  HAL_Delay(10);
+
   /*--- FOC 初始化 ---*/
   FOC_Init();
 
-  /* 电流零点校准：在 PWM 未启动时读取 ADC 平均值 */
+  /* 电流零点校准（PWM 未启动时软件触发注入转换取平均值） */
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
   HAL_Delay(100);
   {
       int32_t sum_a = 0, sum_b = 0;
-      for (int i = 0; i < 100; i++) {
-          sum_a += ADC1->JDR1;
-          sum_b += ADC2->JDR1;
-          HAL_Delay(1);
+      for (int i = 0; i < 128; i++) {
+          sum_a += ADC_InjectedReadOnce(&hadc1);
+          sum_b += ADC_InjectedReadOnce(&hadc2);
       }
-      FOC_fIaOffsetAdc = (float)sum_a / 100.0f;
-      FOC_fIbOffsetAdc = (float)sum_b / 100.0f;
+      FOC_fIaOffsetAdc = (float)sum_a / 128.0f;
+      FOC_fIbOffsetAdc = (float)sum_b / 128.0f;
   }
 
-
-
-  /*--- 启动 TIM1 六路 PWM 输出 ---*/
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-
-  /*--- 启动 ADC 注入组中断模式（由 TIM1_CH4 硬件触发） ---*/
-  HAL_ADCEx_InjectedStart_IT(&hadc1);
-  HAL_ADCEx_InjectedStart_IT(&hadc2);
-
-  /*--- 使能 TIM1 更新中断（10kHz） ---*/
-  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+  /* TIM1 中断优先级（仅配置，不使能，由 Motor_Start 使能） */
   HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
 
-
-  __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
-  __HAL_UART_ENABLE_IT(&huart3, UART_IT_RXNE);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-#ifdef FOC_DEBUG_TEST
-    /*--- 按键扫描（带消抖） ---*/
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    /*--- 按键扫描 ---*/
     KEY_Scan();
 
-    /*--- 按键处理 ---*/
-    if (s_u8KeyRunPressed)
+    /*--- 单键启停：释放一次切换一次状态 ---*/
+    if (KEY_GetEvent(KEY_ID_RUN) == KEY_EVENT_RELEASE)
     {
-        s_u8KeyRunPressed = 0;
-        g_stCtrl.f32TargetRpm = (float)SPEED_RUN;
-    }
-
-    if (s_u8KeyStopPressed)
-    {
-        s_u8KeyStopPressed = 0;
-        g_stCtrl.f32TargetRpm = 0.0f;
-    }
-
-    if (s_u8KeyUpPressed)
-    {
-        s_u8KeyUpPressed = 0;
-        if (g_stCtrl.f32TargetRpm > 0.0f)
+        if (s_u8MotorRunning)
         {
-            float fNew = g_stCtrl.f32TargetRpm + (float)SPEED_STEP;
-            if (fNew > (float)SPEED_MAX) fNew = (float)SPEED_MAX;
-            g_stCtrl.f32TargetRpm = fNew;
+            Motor_Stop();
+        }
+        else
+        {
+            Motor_Start();
         }
     }
 
-    if (s_u8KeyDownPressed)
+    /*--- LED1 (PB12) 以 1Hz 闪烁 ---*/
     {
-        s_u8KeyDownPressed = 0;
-        if (g_stCtrl.f32TargetRpm > 0.0f)
+        static uint32_t s_u32LedTick = 0;
+        if (HAL_GetTick() - s_u32LedTick >= 500U)
         {
-            float fNew = g_stCtrl.f32TargetRpm - (float)SPEED_STEP;
-            if (fNew < (float)SPEED_MIN) fNew = (float)SPEED_MIN;
-            g_stCtrl.f32TargetRpm = fNew;
+            s_u32LedTick = HAL_GetTick();
+            HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
         }
     }
 
-    /* 发送 VOFA+ 数据（约 100Hz，避免阻塞主循环） */
+    /*--- VOFA FireWater telemetry, 5Hz ---*/
     {
-        static uint32_t s_u32LastSendTick = 0;
-        uint32_t u32Now = HAL_GetTick();
-        if (u32Now - s_u32LastSendTick >= 10)
+        static uint32_t s_u32VofaTick = 0;
+        if (HAL_GetTick() - s_u32VofaTick >= 200U)
         {
-            s_u32LastSendTick = u32Now;
-            FOC_State_Send();
+            s_u32VofaTick = HAL_GetTick();
+            VOFA_SendTelemetry();
         }
-    }
-#endif
-    /* USER CODE END WHILE */
-    /* USER CODE BEGIN 3 */
-    /*--- LED1 (PB12) 以 1Hz 闪烁（低电平点亮） ---*/
-    static uint32_t s_u32LedTick = 0;
-    if (HAL_GetTick() - s_u32LedTick >= 500U)
-    {
-        s_u32LedTick = HAL_GetTick();
-        HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
     }
   }
   /* USER CODE END 3 */
@@ -390,35 +361,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-/**
-  * @brief  UART 命令解析处理
-  *         支持命令格式："cmd:param=value\r\n"
-  *         当前支持命令：
-  *           set:uq=<value>       设置 Iq 电流指令 (Q15)
-  *           set:id=<value>       设置 Id 电流指令 (Q15)
-  *           set:targetspeed=<rpm> 设置目标转速 (RPM)
-  *
-  * @note  无回显，不阻塞 VOFA+ 数据流。
-  */
-void UART3_ProcessReceivedData(void)
-{
-    if (Uart3_Rx_F == 1)
-    {
-        Uart3_Rx_F = 0;
-        Uart3_Rx_Data_Len = 0;
-    }
-}
 
-#ifdef FOC_DEBUG_TEST
-/**
-  * @brief  TIM 周期中断回调
-  *         TIM1 更新中断仅用于重装备 ADC 触发，控制环已移至 ADC 中断中。
-  */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    (void)htim;
-}
-#endif
 /* USER CODE END 4 */
 
 /**
@@ -428,26 +371,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
