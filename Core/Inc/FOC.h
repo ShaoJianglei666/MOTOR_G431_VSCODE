@@ -59,12 +59,18 @@ extern "C" {
 #define FOC_CURRENT_POLARITY_B     (-1.0f)
 
 /*--- IF 开环参数 ---*/
-#define FOC_FORCE_OPEN_LOOP         1         /**< 1=只运行开环调试, 0=允许切换闭环 */
+#define FOC_FORCE_OPEN_LOOP         0         /**< 1=只运行开环调试, 0=允许切换闭环 */
 #define FOC_IF_ALIGN_ID             0.0f      /**< 参考启动阶段不做静止 Id 对齐 */
-#define FOC_IF_IQ_START             0.1526f   /**< Iq 软启动起点 (pu), =5000/32768 */
-#define FOC_IF_STARTUP_IQ           0.0916f   /**< IF 启动 Iq 参考 (pu), =3000/32768 */
+#define FOC_Q12_TO_PU(x)            ((x) / 4096.0f)
+#define FOC_PU_TO_Q12(x)            ((x) * 4096.0f)
+#define FOC_IF_IQ_START_Q12         500.0f    /**< Iq 软启动起点 (Q12计数, 约0.24A@2A基值) */
+#define FOC_IF_STARTUP_IQ_Q12       300.0f    /**< IF 启动 Iq 参考 (Q12计数, 约0.15A@2A基值) */
+#define FOC_IF_IQ_START             FOC_Q12_TO_PU(FOC_IF_IQ_START_Q12)
+#define FOC_IF_STARTUP_IQ           FOC_Q12_TO_PU(FOC_IF_STARTUP_IQ_Q12)
+#define FOC_CLOSED_IQ_BASE_RATIO    (1.0f / 3.0f) /**< 闭环维持电流目标比例 */
+#define FOC_CLOSED_IQ_BASE_TARGET   (FOC_IF_STARTUP_IQ * FOC_CLOSED_IQ_BASE_RATIO)
 #define FOC_IF_IQ_RAMP_FRAMES       1000U     /**< Iq 软启动时间 (100ms@10kHz) */
-#define FOC_IF_SWITCH_RPM           1200.0f   /**< 本工程闭环切换转速 (RPM) */
+#define FOC_IF_SWITCH_RPM           1000.0f    /**< 本工程闭环切换转速 (RPM) */
 #define FOC_IF_SETTLE_FRAMES        20000U    /**< 切换转速恒速等待 (2s@10kHz) */
 #define FOC_IF_RAMP_STEP_RPM        50.0f     /**< 加速步长 (RPM) */
 #define FOC_IF_RAMP_INTERVAL        800U      /**< 加速间隔 (帧, 80ms@10kHz) */
@@ -73,6 +79,14 @@ extern "C" {
 #define FOC_TRANSITION_FRAMES       5000U     /**< 角度渐进切换帧数 (500ms@10kHz) */
 #define FOC_CLOSED_STABLE_FRAMES    20000U    /**< 闭环切换后失锁屏蔽帧数 (2s@10kHz) */
 #define FOC_OBS_LOST_THRESHOLD      5000U     /**< 观测器失锁保护帧数 (500ms@10kHz) */
+
+/*--- 诊断阶段码（串口可视化） ---*/
+#define FOC_STAGE_STOP              0U
+#define FOC_STAGE_ALIGN             1U        /**< Iq 软启动/起动阶段 */
+#define FOC_STAGE_OPEN_LOOP         2U        /**< IF 开环加速/恒速阶段 */
+#define FOC_STAGE_TRANSITION        3U        /**< 角度渐变切换阶段 */
+#define FOC_STAGE_CLOSED_LOOP       4U        /**< 闭环运行阶段 */
+#define FOC_STAGE_FAULT             5U
 
 /*--- 电压前馈参数（基于 Motor_Param.h） ---*/
 /** @brief 电流基值 (A) */
@@ -111,11 +125,20 @@ extern "C" {
 #define FOC_PI_ID_KI                0.001f
 #define FOC_PI_IQ_KP                0.05f
 #define FOC_PI_IQ_KI                0.001f
-#define FOC_PI_SPEED_KP             0.00001863f  /**< 约 2500/(4096*32768), RPM -> Iq pu */
-#define FOC_PI_SPEED_KI             0.0000000745f /**< 约 10/(4096*32768), RPM -> Iq pu */
-#define FOC_PI_SPEED_OUT_MAX        0.9155f      /**< 速度环 Iq 上限, =30000/32768 */
-#define FOC_PI_SPEED_OUT_MIN       (-0.9155f)
+/*--- PI 速度环增益（按参考工程 Q12：K_float = K_q12 / 4096） ---*/
+#define FOC_PI_SPEED_KP             0.910f      /**< 2500/4096, 输出单位为Q12计数 */
+#define FOC_PI_SPEED_KI             0.00044f    /**< 10/4096, 输出单位为Q12计数 */
+#define FOC_CLOSED_IQ_REF_MAX_Q12   800.0f      /**< 闭环 IqRef 上限 (Q12计数, 约0.39A@2A基值) */
+#define FOC_PI_SPEED_OUT_MAX        FOC_CLOSED_IQ_REF_MAX_Q12
+#define FOC_PI_SPEED_OUT_MIN        (-FOC_CLOSED_IQ_REF_MAX_Q12)
+#define FOC_CLOSED_IQ_REF_MAX       FOC_Q12_TO_PU(FOC_CLOSED_IQ_REF_MAX_Q12)
+#define FOC_PI_SPEED_ERR_DEADBAND_RPM 2.0f    /**< 速度环误差死区，防止零点附近抖动 */
+#define FOC_PI_SPEED_UNWIND_KP      0.05f     /**< 过速/欠速时反向积分软泄放系数 (Q12计数/RPM) */
+#define FOC_PI_SPEED_SLEW_UP_Q12    12.0f     /**< 速度PI输出上升斜率限制 (Q12计数/速度环周期) */
+#define FOC_PI_SPEED_SLEW_DOWN_Q12  8.0f      /**< 速度PI输出下降斜率限制 (Q12计数/速度环周期) */
 #define FOC_SPEED_LOOP_DECIMATION   20U          /**< 速度环 10kHz/20=500Hz */
+#define FOC_SPEED_RAMP_DIV          10U          /**< 每 10 个速度 PI 周期更新一次目标斜坡 */
+#define FOC_SPEED_RAMP_STEP_RPM     2.0f         /**< 目标转速斜坡步长, 约 100rpm/s */
 
 /*--- 正弦查找表 ---*/
 #define FOC_SIN_TABLE_SIZE          256U
@@ -176,7 +199,13 @@ typedef struct
     float     f32ThetaErrSave;  /**< 过渡开始时 θobs - θif 的带符号误差 (rad) */
     float     f32ThetaIfRef;    /**< 过渡开始时 IF 角度 (rad) */
     float     f32TorqueAngle;   /**< 观测角度相对控制角度的正向角差 (rad) */
+    float     f32RampedTargetRpm; /**< 速率限制后的目标转速 (RPM) */
+    float     f32SpdIntegral;   /**< 速度 PI 积分项诊断 (pu) */
+    float     f32SpdProportional; /**< 速度 PI 比例项诊断 (pu) */
+    float     f32IqBase;        /**< 闭环维持 Iq 基准 (pu), 速度 PI 在此基础上追加 */
+    float     f32IqBaseTarget;  /**< 闭环维持 Iq 基准目标 (pu) */
     uint16_t  u16DiagTransitionFlag; /**< 诊断：过渡阶段标志 */
+    uint16_t  u16DiagStage;     /**< 诊断阶段码: FOC_STAGE_xxx */
 } FOC_ControlState;
 
 /**
@@ -186,7 +215,10 @@ typedef struct
 {
     float fKp;
     float fKi;
+    float fErrPrev;
+    float fOutPrev;
     float fIntegral;
+    float fProportional;
     float fOutMax;
     float fOutMin;
 } FOC_PI;

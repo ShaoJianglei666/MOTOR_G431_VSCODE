@@ -195,7 +195,7 @@ static float VOFA_WrapDeg180(float deg)
 
 static void VOFA_SendTelemetry(void)
 {
-    char buf[288];
+    char buf[384];
     int pos = 0;
     float theta_open_deg = VOFA_RadToDeg(g_stMotor.f32Theta);
     float theta_obs_deg = VOFA_RadToDeg(g_stLuenberger.f32ThetaObs);
@@ -226,8 +226,16 @@ static void VOFA_SendTelemetry(void)
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stLuenberger.f32SpeedObs);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stLuenberger.f32BemfMag);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",%u", (unsigned int)g_stLuenberger.u16Locked);
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32RampedTargetRpm);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stPiSpeed.fOutPrev);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32SpdProportional);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32SpdIntegral);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32IqBase);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",%u", (unsigned int)g_stCtrl.u16DiagStage);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "\n");
 
     if ((pos > 0) && (pos < (int)sizeof(buf)))

@@ -156,7 +156,7 @@ void FOC_Svpwm(float fValpha, float fVbeta,
     *pu16Tb = (uint16_t)fclamp(fTb, 0.0f, fArr);
     *pu16Tc = (uint16_t)fclamp(fTc, 0.0f, fArr);
 
-    /*--- 步骤4: xyz 法判断扇区（与旧版 Q15 版本完全兼容） ---*/
+    /*--- 步骤4: xyz 法判断扇区 ---*/
     fX = fVbeta;
     fY = 0.5f * (FOC_SQRT3 * fValpha + fVbeta);
     fZ = 0.5f * (-FOC_SQRT3 * fValpha + fVbeta);
@@ -482,7 +482,7 @@ void FOC_StateMachine_Run(void)
             {
                 g_stMotor.f32Theta = g_stLuenberger.f32ThetaObs;
 
-                /* 预载速度 PI 积分 */
+                /* 预载速度 PI 积分：速度 PI 内部输出为 Q12 计数，进入电流环前转 pu。 */
                 float fSpdErr  = g_stCtrl.f32TargetRpm - g_stLuenberger.f32SpeedObs;
                 float fKpTerm  = FOC_PI_SPEED_KP * fSpdErr;
 
@@ -490,9 +490,10 @@ void FOC_StateMachine_Run(void)
                 if (fCurSpd < 1.0f) fCurSpd = 1.0f;
                 float fIqEst = g_stCtrl.f32IqRef * FOC_CTRL_RPM_SWITCH / fCurSpd;
                 if (fIqEst > g_stCtrl.f32IqRef) fIqEst = g_stCtrl.f32IqRef;
-                if (fIqEst < 0.0305f) fIqEst = 0.0305f;  /* ≈1000/32768 */
+                if (fIqEst < FOC_Q12_TO_PU(1000.0f))
+                    fIqEst = FOC_Q12_TO_PU(1000.0f);
 
-                g_stPiSpeed.fIntegral = fIqEst - fKpTerm;
+                g_stPiSpeed.fIntegral = FOC_PU_TO_Q12(fIqEst) - fKpTerm;
                 if (g_stPiSpeed.fIntegral > g_stPiSpeed.fOutMax)
                     g_stPiSpeed.fIntegral = g_stPiSpeed.fOutMax;
                 if (g_stPiSpeed.fIntegral < g_stPiSpeed.fOutMin)
@@ -589,11 +590,11 @@ void FOC_ControlStep(void)
                 g_stPiSpeed.fKi = FOC_PI_SPEED_KI;
             }
 
-            g_stCtrl.f32IqRef = FOC_PI_Run(&g_stPiSpeed,
-                g_stCtrl.f32TargetRpm, g_stLuenberger.f32SpeedObs);
+            g_stCtrl.f32IqRef = FOC_Q12_TO_PU(FOC_PI_Run(&g_stPiSpeed,
+                g_stCtrl.f32TargetRpm, g_stLuenberger.f32SpeedObs));
 
             /* 保存速度 PI 比例项用于诊断 */
-            g_stCtrl.f32ThetaErrSave = FOC_PI_SPEED_KP * fSpdErr;
+            g_stCtrl.f32ThetaErrSave = FOC_Q12_TO_PU(FOC_PI_SPEED_KP * fSpdErr);
         }
     }
     else

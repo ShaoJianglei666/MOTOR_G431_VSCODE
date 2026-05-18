@@ -193,24 +193,86 @@ void FOC_InvPark(float fVd, float fVq, float fTheta,
 float FOC_PI_Run(FOC_PI *pstPi, float fRef, float fFb)
 {
     float fErr = fRef - fFb;
-    float fP;
+    float fDelta;
     float fOut;
-    float fIntegralNew;
+    float fKiTerm;
 
-    fP = pstPi->fKp * fErr;
-    fOut = fP + pstPi->fIntegral;
+    pstPi->fProportional = pstPi->fKp * fErr;
+    fDelta = pstPi->fKp * (fErr - pstPi->fErrPrev);
+    pstPi->fErrPrev = fErr;
 
-    /* 饱和时只允许积分往退出饱和的方向走，避免错误反馈时快速打满。 */
-    if (!((fOut >= pstPi->fOutMax && fErr > 0.0f) ||
-          (fOut <= pstPi->fOutMin && fErr < 0.0f)))
+    fKiTerm = pstPi->fKi * fErr;
+
+    if (!((pstPi->fOutPrev >= pstPi->fOutMax && fKiTerm > 0.0f) ||
+          (pstPi->fOutPrev <= pstPi->fOutMin && fKiTerm < 0.0f)))
     {
-        fIntegralNew = pstPi->fIntegral + pstPi->fKi * fErr;
-        pstPi->fIntegral = fclamp(fIntegralNew, pstPi->fOutMin, pstPi->fOutMax);
+        fDelta += fKiTerm;
+        pstPi->fIntegral += fKiTerm;
+        pstPi->fIntegral = fclamp(pstPi->fIntegral,
+                                  pstPi->fOutMin * 0.5f,
+                                  pstPi->fOutMax * 0.5f);
     }
 
-    fOut = fP + pstPi->fIntegral;
+    fOut = pstPi->fOutPrev + fDelta;
+    fOut = fclamp(fOut, pstPi->fOutMin, pstPi->fOutMax);
+    pstPi->fOutPrev = fOut;
+
+    return fOut;
+}
+
+static float FOC_SpeedPI_Run(FOC_PI *pstPi, float fRefRpm, float fFbRpm)
+{
+    float fErr = fRefRpm - fFbRpm;
+    float fOut;
+    float fIntDelta;
+    float fStep;
+
+    if ((fErr < FOC_PI_SPEED_ERR_DEADBAND_RPM) &&
+        (fErr > -FOC_PI_SPEED_ERR_DEADBAND_RPM))
+    {
+        fErr = 0.0f;
+    }
+
+    pstPi->fProportional = pstPi->fKp * fErr;
+
+    fOut = pstPi->fProportional + pstPi->fIntegral;
+    fIntDelta = pstPi->fKi * fErr;
+
+    if (!((fOut >= pstPi->fOutMax && fIntDelta > 0.0f) ||
+          (fOut <= pstPi->fOutMin && fIntDelta < 0.0f)))
+    {
+        pstPi->fIntegral += fIntDelta;
+    }
+
+    if ((fErr < 0.0f) && (pstPi->fIntegral > 0.0f))
+    {
+        pstPi->fIntegral += FOC_PI_SPEED_UNWIND_KP * fErr;
+    }
+    else if ((fErr > 0.0f) && (pstPi->fIntegral < 0.0f))
+    {
+        pstPi->fIntegral += FOC_PI_SPEED_UNWIND_KP * fErr;
+    }
+
+    pstPi->fIntegral = fclamp(pstPi->fIntegral,
+                              pstPi->fOutMin,
+                              pstPi->fOutMax);
+
+    fOut = pstPi->fProportional + pstPi->fIntegral;
     fOut = fclamp(fOut, pstPi->fOutMin, pstPi->fOutMax);
 
+    fStep = fOut - pstPi->fOutPrev;
+    if (fStep > FOC_PI_SPEED_SLEW_UP_Q12)
+    {
+        fOut = pstPi->fOutPrev + FOC_PI_SPEED_SLEW_UP_Q12;
+    }
+    else if (fStep < -FOC_PI_SPEED_SLEW_DOWN_Q12)
+    {
+        fOut = pstPi->fOutPrev - FOC_PI_SPEED_SLEW_DOWN_Q12;
+    }
+
+    fOut = fclamp(fOut, pstPi->fOutMin, pstPi->fOutMax);
+    pstPi->fOutPrev = fOut;
+    pstPi->fErrPrev = fErr;
     return fOut;
 }
 
@@ -224,26 +286,36 @@ void FOC_Init(void)
 
     g_stCtrl.eMode        = FOC_MODE_STOP;
     g_stCtrl.f32TargetRpm = 0.0f;
+    g_stCtrl.u16DiagStage = FOC_STAGE_STOP;
     FOC_Luenberger_Init();
 
     /* Id PI */
     g_stPiId.fKp       = FOC_PI_ID_KP;
     g_stPiId.fKi       = FOC_PI_ID_KI;
+    g_stPiId.fErrPrev  = 0.0f;
+    g_stPiId.fOutPrev  = 0.0f;
     g_stPiId.fIntegral = 0.0f;
+    g_stPiId.fProportional = 0.0f;
     g_stPiId.fOutMax   =  FOC_PI_CORRECTION_MAX_PU;
     g_stPiId.fOutMin   = -FOC_PI_CORRECTION_MAX_PU;
 
     /* Iq PI */
     g_stPiIq.fKp       = FOC_PI_IQ_KP;
     g_stPiIq.fKi       = FOC_PI_IQ_KI;
+    g_stPiIq.fErrPrev  = 0.0f;
+    g_stPiIq.fOutPrev  = 0.0f;
     g_stPiIq.fIntegral = 0.0f;
+    g_stPiIq.fProportional = 0.0f;
     g_stPiIq.fOutMax   =  FOC_PI_CORRECTION_MAX_PU;
     g_stPiIq.fOutMin   = -FOC_PI_CORRECTION_MAX_PU;
 
-    /* Speed PI: output is Iq reference (pu). */
+    /* Speed PI: output is extra Iq on top of the closed-loop base current. */
     g_stPiSpeed.fKp       = FOC_PI_SPEED_KP;
     g_stPiSpeed.fKi       = FOC_PI_SPEED_KI;
+    g_stPiSpeed.fErrPrev  = 0.0f;
+    g_stPiSpeed.fOutPrev  = 0.0f;
     g_stPiSpeed.fIntegral = 0.0f;
+    g_stPiSpeed.fProportional = 0.0f;
     g_stPiSpeed.fOutMax   =  FOC_PI_SPEED_OUT_MAX;
     g_stPiSpeed.fOutMin   =  FOC_PI_SPEED_OUT_MIN;
 }
@@ -258,6 +330,7 @@ static void FOC_StateMachine_Run(void)
     switch (g_stCtrl.eMode)
     {
     case FOC_MODE_STOP:
+        g_stCtrl.u16DiagStage = FOC_STAGE_STOP;
         /* 目标转速 > 0 → 进入 IF 开环 */
         if (g_stCtrl.f32TargetRpm > 0.0f)
         {
@@ -269,12 +342,31 @@ static void FOC_StateMachine_Run(void)
             g_stCtrl.u32BlendCount = 0;
             g_stCtrl.u32SwitchStableCount = 0;
             g_stCtrl.u32ObsLostCount = 0;
+            g_stCtrl.f32RampedTargetRpm = 0.0f;
+            g_stCtrl.f32SpdIntegral = 0.0f;
+            g_stCtrl.f32SpdProportional = 0.0f;
+            g_stCtrl.f32IqBase = 0.0f;
+            g_stCtrl.f32IqBaseTarget = 0.0f;
             g_stCtrl.u16DiagTransitionFlag = 0;
+            g_stCtrl.u16DiagStage = FOC_STAGE_ALIGN;
             g_stMotor.f32Theta    = 0.0f;
 
+            g_stPiId.fErrPrev = 0.0f;
+            g_stPiId.fOutPrev = 0.0f;
             g_stPiId.fIntegral = 0.0f;
+            g_stPiId.fProportional = 0.0f;
+            g_stPiId.fOutMax = FOC_PI_CORRECTION_MAX_PU;
+            g_stPiId.fOutMin = -FOC_PI_CORRECTION_MAX_PU;
+            g_stPiIq.fErrPrev = 0.0f;
+            g_stPiIq.fOutPrev = 0.0f;
             g_stPiIq.fIntegral = 0.0f;
+            g_stPiIq.fProportional = 0.0f;
+            g_stPiIq.fOutMax = FOC_PI_CORRECTION_MAX_PU;
+            g_stPiIq.fOutMin = -FOC_PI_CORRECTION_MAX_PU;
+            g_stPiSpeed.fErrPrev = 0.0f;
+            g_stPiSpeed.fOutPrev = 0.0f;
             g_stPiSpeed.fIntegral = 0.0f;
+            g_stPiSpeed.fProportional = 0.0f;
 
             g_stCtrl.eMode = FOC_MODE_IF_OPENLOOP;
         }
@@ -286,6 +378,7 @@ static void FOC_StateMachine_Run(void)
         if (g_stCtrl.f32TargetRpm == 0.0f)
         {
             g_stCtrl.eMode = FOC_MODE_STOP;
+            g_stCtrl.u16DiagStage = FOC_STAGE_STOP;
             break;
         }
 
@@ -295,10 +388,12 @@ static void FOC_StateMachine_Run(void)
             float fProgress = (float)g_stCtrl.u32RampCount / (float)FOC_IF_IQ_RAMP_FRAMES;
             g_stCtrl.f32IqRef = FOC_IF_IQ_START
                                + (FOC_IF_STARTUP_IQ - FOC_IF_IQ_START) * fProgress;
+            g_stCtrl.u16DiagStage = FOC_STAGE_ALIGN;
         }
         else
         {
             g_stCtrl.f32IqRef = FOC_IF_STARTUP_IQ;
+            g_stCtrl.u16DiagStage = FOC_STAGE_OPEN_LOOP;
         }
         g_stCtrl.f32IdRef = 0.0f;
 
@@ -348,6 +443,7 @@ static void FOC_StateMachine_Run(void)
                     g_stCtrl.f32ThetaIfRef = g_stMotor.f32Theta;
                     g_stCtrl.u32BlendCount = 0;
                     g_stCtrl.u16DiagTransitionFlag = 1U;
+                    g_stCtrl.u16DiagStage = FOC_STAGE_TRANSITION;
                     g_stCtrl.eMode = FOC_MODE_TRANSITION;
                 }
             }
@@ -371,8 +467,11 @@ static void FOC_StateMachine_Run(void)
         if (g_stCtrl.f32TargetRpm == 0.0f)
         {
             g_stCtrl.eMode = FOC_MODE_STOP;
+            g_stCtrl.u16DiagStage = FOC_STAGE_STOP;
             break;
         }
+
+        g_stCtrl.u16DiagStage = FOC_STAGE_TRANSITION;
 
         g_stCtrl.u32BlendCount++;
         fCnt = (float)g_stCtrl.u32BlendCount;
@@ -392,38 +491,73 @@ static void FOC_StateMachine_Run(void)
 
         if (g_stCtrl.u32BlendCount >= FOC_TRANSITION_FRAMES)
         {
-            float fSpdErr;
-            float fKpTerm;
-            float fCurSpd;
-            float fIqEst;
+            float fIqPreload;
 
             g_stMotor.f32Theta = g_stLuenberger.f32ThetaObs;
 
-            fSpdErr = g_stCtrl.f32TargetRpm - g_stLuenberger.f32SpeedObs;
-            fKpTerm = FOC_PI_SPEED_KP * fSpdErr;
-
-            fCurSpd = g_stLuenberger.f32SpeedObs;
-            if (fCurSpd < 1.0f)
+            /*--- 预载速度 PI：对标 Q12 参考工程，根据转速比估算维持 Iq ---*/
+            /* Q12 参考: i32IqEst = i16IqRef * FOC_CTRL_RPM_SWITCH / u16TargetRpm / 3 */
+            fIqPreload = g_stCtrl.f32IqRef
+                       * FOC_IF_SWITCH_RPM
+                       / g_stCtrl.f32TargetRpm
+                       * FOC_CLOSED_IQ_BASE_RATIO;
+            if (fIqPreload > g_stCtrl.f32IqRef)
             {
-                fCurSpd = 1.0f;
+                fIqPreload = g_stCtrl.f32IqRef;
+            }
+            if (fIqPreload < FOC_CLOSED_IQ_BASE_TARGET)
+            {
+                fIqPreload = FOC_CLOSED_IQ_BASE_TARGET;
             }
 
-            fIqEst = g_stCtrl.f32IqRef * FOC_IF_SWITCH_RPM / fCurSpd;
-            if (fIqEst > g_stCtrl.f32IqRef)
+            /* 速度 PI 内部输出为 Q12 计数，进入电流环前再转为 pu。 */
             {
-                fIqEst = g_stCtrl.f32IqRef;
-            }
-            if (fIqEst < 0.0305f)
-            {
-                fIqEst = 0.0305f;
+                float fCurSpd = g_stLuenberger.f32SpeedObs;
+                if (fCurSpd < 0.0f)
+                    fCurSpd = 0.0f;
+                if (fCurSpd > g_stCtrl.f32TargetRpm)
+                    fCurSpd = g_stCtrl.f32TargetRpm;
+                g_stCtrl.f32RampedTargetRpm = fCurSpd;
             }
 
-            g_stPiSpeed.fIntegral = fclamp(fIqEst - fKpTerm,
-                                           g_stPiSpeed.fOutMin,
-                                           g_stPiSpeed.fOutMax);
+            g_stPiSpeed.fOutMax = FOC_PI_SPEED_OUT_MAX;
+            g_stPiSpeed.fOutMin = FOC_PI_SPEED_OUT_MIN;
+            g_stPiSpeed.fErrPrev = g_stCtrl.f32RampedTargetRpm - g_stLuenberger.f32SpeedObs;
+            g_stPiSpeed.fOutPrev = FOC_PU_TO_Q12(fIqPreload);
+            g_stPiSpeed.fIntegral = FOC_PU_TO_Q12(fIqPreload);
+            g_stPiSpeed.fProportional = FOC_PI_SPEED_KP * g_stPiSpeed.fErrPrev;
+
+            /* 不设置 f32IqRef：保持过渡阶段值，直到速度 PI 在下一 500Hz 周期自然接管输出 */
+            /* 保存基准电流（仅诊断） */
+            g_stCtrl.f32IqBase = fIqPreload;
+            g_stCtrl.f32IqBaseTarget = FOC_CLOSED_IQ_BASE_TARGET;
+
+            /* 预载电流环 PI，确保 Ud/Uq 连续 */
+            g_stPiId.fOutMax = FOC_VOLTAGE_MAX_PU;
+            g_stPiId.fOutMin = -FOC_VOLTAGE_MAX_PU;
+            g_stPiIq.fOutMax = FOC_VOLTAGE_MAX_PU;
+            g_stPiIq.fOutMin = -FOC_VOLTAGE_MAX_PU;
+
+            g_stPiId.fErrPrev = g_stCtrl.f32IdRef - g_stMotor.f32Id;
+            g_stPiId.fOutPrev = fclamp(g_stMotor.f32UdRef,
+                                       g_stPiId.fOutMin,
+                                       g_stPiId.fOutMax);
+            g_stPiId.fIntegral = g_stPiId.fOutPrev;
+            g_stPiId.fProportional = g_stPiId.fKp * g_stPiId.fErrPrev;
+
+            g_stPiIq.fErrPrev = g_stCtrl.f32IqRef - g_stMotor.f32Iq;
+            g_stPiIq.fOutPrev = fclamp(g_stMotor.f32UqRef,
+                                       g_stPiIq.fOutMin,
+                                       g_stPiIq.fOutMax);
+            g_stPiIq.fIntegral = g_stPiIq.fOutPrev;
+            g_stPiIq.fProportional = g_stPiIq.fKp * g_stPiIq.fErrPrev;
+
+            g_stCtrl.f32SpdProportional = FOC_Q12_TO_PU(g_stPiSpeed.fProportional);
+            g_stCtrl.f32SpdIntegral = FOC_Q12_TO_PU(g_stPiSpeed.fIntegral);
 
             g_stCtrl.eMode = FOC_MODE_CLOSED_LOOP;
             g_stCtrl.u16DiagTransitionFlag = 0U;
+            g_stCtrl.u16DiagStage = FOC_STAGE_CLOSED_LOOP;
             g_stCtrl.u32SwitchStableCount = 0;
             g_stCtrl.u32ObsLostCount = 0;
         }
@@ -434,12 +568,14 @@ static void FOC_StateMachine_Run(void)
         if (g_stCtrl.f32TargetRpm == 0.0f)
         {
             g_stCtrl.eMode = FOC_MODE_STOP;
+            g_stCtrl.u16DiagStage = FOC_STAGE_STOP;
             break;
         }
 
+        g_stCtrl.u16DiagStage = FOC_STAGE_CLOSED_LOOP;
         g_stMotor.f32Theta = g_stLuenberger.f32ThetaObs;
         g_stCtrl.f32IdRef = 0.0f;
-        g_stCtrl.f32RpmRamp = g_stCtrl.f32TargetRpm;
+        g_stCtrl.f32RpmRamp = g_stLuenberger.f32SpeedObs;
 
         if (g_stCtrl.u32SwitchStableCount < FOC_CLOSED_STABLE_FRAMES)
         {
@@ -451,10 +587,26 @@ static void FOC_StateMachine_Run(void)
             if (g_stCtrl.u32ObsLostCount >= FOC_OBS_LOST_THRESHOLD)
             {
                 g_stCtrl.eMode = FOC_MODE_STOP;
+                g_stCtrl.u16DiagStage = FOC_STAGE_STOP;
                 g_stCtrl.f32TargetRpm = 0.0f;
+                g_stCtrl.f32IqBase = 0.0f;
+                g_stCtrl.f32IqBaseTarget = 0.0f;
+                g_stPiId.fErrPrev = 0.0f;
+                g_stPiId.fOutPrev = 0.0f;
                 g_stPiId.fIntegral = 0.0f;
+                g_stPiId.fProportional = 0.0f;
+                g_stPiId.fOutMax = FOC_PI_CORRECTION_MAX_PU;
+                g_stPiId.fOutMin = -FOC_PI_CORRECTION_MAX_PU;
+                g_stPiIq.fErrPrev = 0.0f;
+                g_stPiIq.fOutPrev = 0.0f;
                 g_stPiIq.fIntegral = 0.0f;
+                g_stPiIq.fProportional = 0.0f;
+                g_stPiIq.fOutMax = FOC_PI_CORRECTION_MAX_PU;
+                g_stPiIq.fOutMin = -FOC_PI_CORRECTION_MAX_PU;
+                g_stPiSpeed.fErrPrev = 0.0f;
+                g_stPiSpeed.fOutPrev = 0.0f;
                 g_stPiSpeed.fIntegral = 0.0f;
+                g_stPiSpeed.fProportional = 0.0f;
             }
         }
         else
@@ -464,6 +616,7 @@ static void FOC_StateMachine_Run(void)
         break;
 
     case FOC_MODE_FAULT:
+        g_stCtrl.u16DiagStage = FOC_STAGE_FAULT;
         break;
     }
 }
@@ -482,6 +635,7 @@ void FOC_Luenberger_Init(void)
 void FOC_Luenberger_Run(void)
 {
     float fOmegaOpen;
+    float fSpeedBlend;
     float fDiAlpha;
     float fDiBeta;
     float fEalpha;
@@ -518,8 +672,9 @@ void FOC_Luenberger_Run(void)
 
     fOmegaOpen = g_stCtrl.f32RpmRamp * FOC_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
     fOmegaOpen = fclamp(fOmegaOpen, 0.0f, FOC_OBS_MAX_OMEGA_ELEC);
+    fSpeedBlend = (g_stCtrl.eMode == FOC_MODE_CLOSED_LOOP) ? 0.0f : FOC_OBS_PLL_SPEED_BLEND;
 
-    s_fObsOmegaElec += FOC_OBS_PLL_SPEED_BLEND * (fOmegaOpen - s_fObsOmegaElec)
+    s_fObsOmegaElec += fSpeedBlend * (fOmegaOpen - s_fObsOmegaElec)
                      + FOC_OBS_PLL_KI * fErr;
     s_fObsOmegaElec = fclamp(s_fObsOmegaElec, 0.0f, FOC_OBS_MAX_OMEGA_ELEC);
 
@@ -556,6 +711,7 @@ void FOC_ControlStep(void)
 {
 #if !FOC_FORCE_OPEN_LOOP
     static uint16_t s_u16SpeedLoopCnt = 0U;
+    static uint16_t s_u16SpeedRampDiv = 0U;
 #endif
     float fUdPi;
     float fUqPi;
@@ -570,6 +726,7 @@ void FOC_ControlStep(void)
     {
 #if !FOC_FORCE_OPEN_LOOP
         s_u16SpeedLoopCnt = 0U;
+        s_u16SpeedRampDiv = 0U;
 #endif
         TIM1->CCR1 = PWM_HALF_CYCLE;
         TIM1->CCR2 = PWM_HALF_CYCLE;
@@ -577,7 +734,7 @@ void FOC_ControlStep(void)
         return;
     }
 
-    /*--- 闭环速度 PI：输出 IqRef，参考工程为 500Hz 分频执行 ---*/
+    /*--- 闭环速度 PI：Q12输出转pu后作为 IqRef，500Hz 分频 ---*/
 #if !FOC_FORCE_OPEN_LOOP
     if (g_stCtrl.eMode == FOC_MODE_CLOSED_LOOP)
     {
@@ -585,14 +742,45 @@ void FOC_ControlStep(void)
         if (s_u16SpeedLoopCnt >= FOC_SPEED_LOOP_DECIMATION)
         {
             s_u16SpeedLoopCnt = 0U;
-            g_stCtrl.f32IqRef = FOC_PI_Run(&g_stPiSpeed,
-                                           g_stCtrl.f32TargetRpm,
-                                           g_stLuenberger.f32SpeedObs);
+
+            /*--- 目标转速斜坡 ---*/
+            s_u16SpeedRampDiv++;
+            if (s_u16SpeedRampDiv >= FOC_SPEED_RAMP_DIV)
+            {
+                s_u16SpeedRampDiv = 0U;
+                if (g_stCtrl.f32RampedTargetRpm < g_stCtrl.f32TargetRpm)
+                {
+                    g_stCtrl.f32RampedTargetRpm += FOC_SPEED_RAMP_STEP_RPM;
+                    if (g_stCtrl.f32RampedTargetRpm > g_stCtrl.f32TargetRpm)
+                        g_stCtrl.f32RampedTargetRpm = g_stCtrl.f32TargetRpm;
+                }
+                else if (g_stCtrl.f32RampedTargetRpm > g_stCtrl.f32TargetRpm)
+                {
+                    g_stCtrl.f32RampedTargetRpm -= FOC_SPEED_RAMP_STEP_RPM;
+                    if (g_stCtrl.f32RampedTargetRpm < g_stCtrl.f32TargetRpm)
+                        g_stCtrl.f32RampedTargetRpm = g_stCtrl.f32TargetRpm;
+                }
+            }
+
+            /* 速度 PI 输出为 Q12 计数，换算为 pu 后再作为电流环 IqRef。 */
+            g_stPiSpeed.fOutMax = FOC_PI_SPEED_OUT_MAX;
+            g_stPiSpeed.fOutMin = FOC_PI_SPEED_OUT_MIN;
+            g_stCtrl.f32IqRef = FOC_Q12_TO_PU(FOC_SpeedPI_Run(&g_stPiSpeed,
+                                                              g_stCtrl.f32RampedTargetRpm,
+                                                              g_stLuenberger.f32SpeedObs));//这里不用除以4096
+            g_stCtrl.f32IqRef = fclamp(g_stCtrl.f32IqRef,
+                                       -FOC_CLOSED_IQ_REF_MAX,
+                                        FOC_CLOSED_IQ_REF_MAX);
+
+            /* 诊断输出 */
+            g_stCtrl.f32SpdProportional = FOC_Q12_TO_PU(g_stPiSpeed.fProportional);
+            g_stCtrl.f32SpdIntegral     = FOC_Q12_TO_PU(g_stPiSpeed.fIntegral);
         }
     }
     else
     {
         s_u16SpeedLoopCnt = 0U;
+        s_u16SpeedRampDiv = 0U;
     }
 #endif
 
@@ -604,18 +792,26 @@ void FOC_ControlStep(void)
     FOC_Park(g_stMotor.f32Ialpha, g_stMotor.f32Ibeta,
              g_stMotor.f32Theta, &g_stMotor.f32Id, &g_stMotor.f32Iq);
 
-    /*--- 第3步：速度电压前馈 + 小幅电流修正 ---
-     * 开环角度不是真实转子角时，不能让电流 PI 主导输出，否则会在错误 dq 坐标中拉大电流。
-     */
-    fUdPi = FOC_PI_Run(&g_stPiId, g_stCtrl.f32IdRef, g_stMotor.f32Id);
-    fUqPi = FOC_PI_Run(&g_stPiIq, g_stCtrl.f32IqRef, g_stMotor.f32Iq);
-    fUqFf = FOC_GetBemfFeedForwardPu() + FOC_RS_PU * g_stCtrl.f32IqRef;
+    if (g_stCtrl.eMode == FOC_MODE_CLOSED_LOOP)
+    {
+        /* 闭环后电流 PI 直接输出完整 Ud/Uq，严格对应参考工程电流环。 */
+        g_stMotor.f32UdRef = FOC_PI_Run(&g_stPiId, g_stCtrl.f32IdRef, g_stMotor.f32Id);
+        g_stMotor.f32UqRef = FOC_PI_Run(&g_stPiIq, g_stCtrl.f32IqRef, g_stMotor.f32Iq);
+        flimit_vector(&g_stMotor.f32UdRef, &g_stMotor.f32UqRef, FOC_VOLTAGE_MAX_PU);
+    }
+    else
+    {
+        /* 开环阶段：速度电压前馈 + 小幅电流修正。 */
+        fUdPi = FOC_PI_Run(&g_stPiId, g_stCtrl.f32IdRef, g_stMotor.f32Id);
+        fUqPi = FOC_PI_Run(&g_stPiIq, g_stCtrl.f32IqRef, g_stMotor.f32Iq);
+        fUqFf = FOC_GetBemfFeedForwardPu() + FOC_RS_PU * g_stCtrl.f32IqRef;
 
-    g_stMotor.f32UdRef = fUdPi;
-    g_stMotor.f32UqRef = fUqFf + fUqPi;
+        g_stMotor.f32UdRef = fUdPi;
+        g_stMotor.f32UqRef = fUqFf + fUqPi;
 
-    fVoltLimit = FOC_GetDynamicVoltageLimitPu();
-    flimit_vector(&g_stMotor.f32UdRef, &g_stMotor.f32UqRef, fVoltLimit);
+        fVoltLimit = FOC_GetDynamicVoltageLimitPu();
+        flimit_vector(&g_stMotor.f32UdRef, &g_stMotor.f32UqRef, fVoltLimit);
+    }
 
     /*--- 第4步：反Park ---*/
     FOC_InvPark(g_stMotor.f32UdRef, g_stMotor.f32UqRef,

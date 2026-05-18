@@ -33,6 +33,9 @@ extern "C" {
 
 /* Exported constants --------------------------------------------------------*/
 
+#define FOC_Q12_TO_PU(x)            ((x) / 4096.0f)
+#define FOC_PU_TO_Q12(x)            ((x) * 4096.0f)
+
 /** @brief 圆周率 π */
 #define FOC_MATH_PI                 3.14159265358979323846f
 /** @brief 2π */
@@ -173,10 +176,12 @@ extern FOC_ControlState g_stCtrl;
 /*--- 切换参数 ---*/
 #define FOC_CTRL_RPM_SWITCH         600.0f   /**< 切换转速 (RPM) */
 #define FOC_CTRL_ALIGN_DURATION     1000U    /**< 初始对齐时长 (1000帧@10kHz=100ms) */
-#define FOC_CTRL_IQ_ALIGN_START     0.1526f  /**< 对齐起始电流 (pu, =5000/32768) */
+#define FOC_CTRL_IQ_ALIGN_START_Q12 5000.0f  /**< 对齐起始电流 (Q12计数) */
+#define FOC_CTRL_IQ_ALIGN_START     FOC_Q12_TO_PU(FOC_CTRL_IQ_ALIGN_START_Q12)
 #define FOC_CTRL_RPM_ACCEL_STEP     50.0f    /**< 加速每步 RPM 增量 */
 #define FOC_CTRL_RPM_ACCEL_INTERVAL 800U     /**< 加速间隔帧数 (800帧@10kHz=80ms) */
-#define FOC_CTRL_IQ_STARTUP         0.0916f  /**< IF 启动电流 (pu, =3000/32768) */
+#define FOC_CTRL_IQ_STARTUP_Q12     3000.0f  /**< IF 启动电流 (Q12计数) */
+#define FOC_CTRL_IQ_STARTUP         FOC_Q12_TO_PU(FOC_CTRL_IQ_STARTUP_Q12)
 #define FOC_CTRL_TORQUE_ANGLE_60    (FOC_MATH_PI / 3.0f)  /**< 60° 转矩角 (rad) */
 #define FOC_CTRL_RPM_SETTLE_FRAMES  20000U   /**< IF 稳速等待帧数 (20000帧@10kHz=2秒) */
 #define FOC_CTRL_SPEED_TOL_PCT      10U      /**< 转速容差百分比 (±10%) */
@@ -199,11 +204,11 @@ typedef struct
     float fOutMin;        /**< 输出下限 */
 } FOC_PI;
 
-/** @brief PI 控制器默认增益（由 Q15 转换：K_float = K_Q15 / 32768） */
-#define FOC_PI_ID_KP          0.25f     /* 原 8192/32768 */
-#define FOC_PI_ID_KI          0.05f     /* 原 1638/32768 */
-#define FOC_PI_IQ_KP          0.25f     /* 原 8192/32768 */
-#define FOC_PI_IQ_KI          0.05f     /* 原 1638/32768 */
+/** @brief PI 控制器默认增益（参考工程为 Q12：K_float = K_q12 / 4096） */
+#define FOC_PI_ID_KP          FOC_Q12_TO_PU(8192.0f)
+#define FOC_PI_ID_KI          FOC_Q12_TO_PU(1638.0f)
+#define FOC_PI_IQ_KP          FOC_Q12_TO_PU(8192.0f)
+#define FOC_PI_IQ_KI          FOC_Q12_TO_PU(1638.0f)
 
 /** @brief PI 控制器实例 */
 extern FOC_PI g_stPiId;
@@ -211,10 +216,11 @@ extern FOC_PI g_stPiIq;
 extern FOC_PI g_stPiSpeed;
 
 /** @brief 速度 PI 默认增益 */
-#define FOC_PI_SPEED_KP       0.30518f  /* 原 10000/32768, Kp≈0.305, RPM→pu(Iq) */
-#define FOC_PI_SPEED_KI       0.003906f /* 原 128/32768,   Ki≈0.0039 */
-#define FOC_PI_SPEED_OUT_MAX  0.9155f   /* 原 30000/32768, Iq 上限 */
-#define FOC_PI_SPEED_OUT_MIN (-0.9155f) /* Iq 下限 */
+#define FOC_PI_SPEED_KP       FOC_Q12_TO_PU(10000.0f)
+#define FOC_PI_SPEED_KI       FOC_Q12_TO_PU(128.0f)
+#define FOC_PI_SPEED_OUT_MAX_Q12  30000.0f
+#define FOC_PI_SPEED_OUT_MAX  FOC_PI_SPEED_OUT_MAX_Q12
+#define FOC_PI_SPEED_OUT_MIN (-FOC_PI_SPEED_OUT_MAX_Q12)
 
 /**
   * @brief 龙伯格观测器状态结构体
@@ -328,27 +334,27 @@ typedef struct
 #define FOC_OBS_K1_DISC             (FOC_TS_PU / FOC_LS_PU)
 
 /** @brief 观测器低通滤波器系数 G1 (越小越平滑) */
-#define FOC_OBS_G1                  0.03125f  /* 原 1024/32768 */
+#define FOC_OBS_G1                  FOC_Q12_TO_PU(1024.0f)
 
 /** @brief 观测器反电势收敛增益 G2 */
-#define FOC_OBS_G2                  0.0078125f /* 原 256/32768 */
+#define FOC_OBS_G2                  FOC_Q12_TO_PU(256.0f)
 
-/** @brief 电感补偿系数 Ls_comp (Q15→float: 688/32768) */
-#define FOC_LS_COMP                 0.021f
+/** @brief 电感补偿系数 Ls_comp (Q12→float) */
+#define FOC_LS_COMP                 FOC_Q12_TO_PU(688.0f)
 
-/** @brief 反电势幅值平方锁定阈值 (pu², ≈(2700/32768)²≈0.0068) */
-#define EMF_LOCK_SQ_THR_F           0.0065f
+/** @brief 反电势幅值平方锁定阈值 (pu², ≈(270/4096)²) */
+#define EMF_LOCK_SQ_THR_F           (FOC_Q12_TO_PU(270.0f) * FOC_Q12_TO_PU(270.0f))
 
 /** @brief 锁定最低转速阈值 (RPM) */
 #define EMF_LOCK_SPD_THR_F          200.0f
 
 /*--- PLL 增益 ---*/
-/** @brief PLL 比例增益 (原 1024/32768) */
-#define FOC_PLL_KP                  0.03125f
-/** @brief PLL 积分增益 (原 512/32768) */
-#define FOC_PLL_KI                  0.015625f
+/** @brief PLL 比例增益 (Q12) */
+#define FOC_PLL_KP                  FOC_Q12_TO_PU(1024.0f)
+/** @brief PLL 积分增益 (Q12) */
+#define FOC_PLL_KI                  FOC_Q12_TO_PU(512.0f)
 /** @brief PLL 误差限幅 (pu) */
-#define FOC_PLL_ERR_MAX             0.125f   /* 原 4096/32768 */
+#define FOC_PLL_ERR_MAX             FOC_Q12_TO_PU(4096.0f)
 /** @brief PLL 积分上限 (电气 rad/s, 对应约 10000RPM) */
 #define FOC_PLL_OMEGA_MAX           1047.2f  /* ≈ 10000RPM × 4π/60 / 2 */
 
