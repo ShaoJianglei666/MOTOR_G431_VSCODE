@@ -55,16 +55,18 @@ extern "C" {
 
 /*--- 电流采样 ---*/
 #define FOC_ADC_CURRENT_SCALE       2048.0f
-#define FOC_CURRENT_POLARITY_A      1.0f
-#define FOC_CURRENT_POLARITY_B      1.0f
+#define FOC_CURRENT_POLARITY_A     (-1.0f)
+#define FOC_CURRENT_POLARITY_B     (-1.0f)
 
 /*--- IF 开环参数 ---*/
-#define FOC_IF_ALIGN_ID             0.015f     /**< 对齐 Id (pu), 从小开始防啸叫 */
-#define FOC_IF_STARTUP_IQ           0.01f     /**< 运行 Iq (pu) */
-#define FOC_IF_ALIGN_FRAMES         3000U     /**< 对齐阶段帧数 (300ms@10kHz) */
-#define FOC_IF_TRANSITION_FRAMES    500U      /**< Id->Iq 过渡帧数 (50ms@10kHz) */
-#define FOC_IF_RAMP_STEP_RPM        20.0f     /**< 加速步长 (RPM), 放慢防失步 */
-#define FOC_IF_RAMP_INTERVAL        400U      /**< 加速间隔 (帧, 40ms@10kHz) */
+#define FOC_IF_ALIGN_ID             0.0f      /**< 参考启动阶段不做静止 Id 对齐 */
+#define FOC_IF_IQ_START             0.05f     /**< Iq 软启动起点 (pu) */
+#define FOC_IF_STARTUP_IQ           0.09f     /**< IF 启动 Iq 参考 (pu), 约 0.18A@2A base */
+#define FOC_IF_IQ_RAMP_FRAMES       1000U     /**< Iq 软启动时间 (100ms@10kHz) */
+#define FOC_IF_SWITCH_RPM           600.0f    /**< 参考代码启动阶段先到 600rpm */
+#define FOC_IF_SETTLE_FRAMES        20000U    /**< 600rpm 恒速等待 (2s@10kHz) */
+#define FOC_IF_RAMP_STEP_RPM        50.0f     /**< 加速步长 (RPM) */
+#define FOC_IF_RAMP_INTERVAL        800U      /**< 加速间隔 (帧, 80ms@10kHz) */
 
 /*--- 电压前馈参数（基于 Motor_Param.h） ---*/
 /** @brief 电流基值 (A) */
@@ -152,6 +154,7 @@ typedef struct
     float     f32RpmRamp;       /**< 斜坡当前转速 (RPM) */
     uint32_t  u32RampCount;     /**< 斜坡计数器（帧） */
     uint32_t  u32RunFrames;     /**< 总运行帧数（诊断） */
+    uint32_t  u32SettleFrames;  /**< 达到切换转速后的恒速等待帧数 */
 } FOC_ControlState;
 
 /**

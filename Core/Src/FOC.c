@@ -239,6 +239,7 @@ void FOC_Init(void)
 static void FOC_StateMachine_Run(void)
 {
     float fStep;
+    float fRpmLimit;
 
     switch (g_stCtrl.eMode)
     {
@@ -248,6 +249,8 @@ static void FOC_StateMachine_Run(void)
         {
             g_stCtrl.f32RpmRamp   = 0.0f;
             g_stCtrl.u32RampCount = 0;
+            g_stCtrl.u32RunFrames = 0;
+            g_stCtrl.u32SettleFrames = 0;
             g_stMotor.f32Theta    = 0.0f;
 
             g_stPiId.fIntegral = 0.0f;
@@ -266,45 +269,51 @@ static void FOC_StateMachine_Run(void)
             break;
         }
 
-        /*--- 阶段1：对齐 — Id 从 0 缓慢斜坡到 ALIGN_ID ---*/
-        if (g_stCtrl.u32RampCount < FOC_IF_ALIGN_FRAMES)
+        /*--- 参考启动阶段：Iq 软启动，角度从一开始缓慢旋转 ---*/
+        if (g_stCtrl.u32RampCount < FOC_IF_IQ_RAMP_FRAMES)
         {
-            float fProgress = (float)g_stCtrl.u32RampCount / (float)FOC_IF_ALIGN_FRAMES;
-            g_stCtrl.f32IdRef = FOC_IF_ALIGN_ID * fProgress;  /* 0 -> ALIGN_ID */
-            g_stCtrl.f32IqRef = 0.0f;
-            /* 对齐阶段不旋转，θ 保持 0 */
-            g_stMotor.f32Theta = 0.0f;
+            float fProgress = (float)g_stCtrl.u32RampCount / (float)FOC_IF_IQ_RAMP_FRAMES;
+            g_stCtrl.f32IqRef = FOC_IF_IQ_START
+                               + (FOC_IF_STARTUP_IQ - FOC_IF_IQ_START) * fProgress;
         }
         else
         {
-            /*--- 阶段2：IF 开环运行 — Id 退出，Iq 进入 ---*/
-            uint32_t u32RunFrames = g_stCtrl.u32RampCount - FOC_IF_ALIGN_FRAMES;
-            if (u32RunFrames < FOC_IF_TRANSITION_FRAMES)
-            {
-                float fTrans = (float)u32RunFrames / (float)FOC_IF_TRANSITION_FRAMES;
-                g_stCtrl.f32IdRef = FOC_IF_ALIGN_ID * (1.0f - fTrans);
-                g_stCtrl.f32IqRef = FOC_IF_STARTUP_IQ * fTrans;
-            }
-            else
-            {
-                g_stCtrl.f32IdRef = 0.0f;
-                g_stCtrl.f32IqRef = FOC_IF_STARTUP_IQ;
-            }
-
-            /*--- 转速斜坡 ---*/
-            if ((g_stCtrl.f32RpmRamp < g_stCtrl.f32TargetRpm) &&
-                ((u32RunFrames % FOC_IF_RAMP_INTERVAL) == 0) &&
-                (u32RunFrames >= FOC_IF_TRANSITION_FRAMES))
-            {
-                g_stCtrl.f32RpmRamp += FOC_IF_RAMP_STEP_RPM;
-                if (g_stCtrl.f32RpmRamp > g_stCtrl.f32TargetRpm)
-                    g_stCtrl.f32RpmRamp = g_stCtrl.f32TargetRpm;
-            }
-
-            /*--- 角度积分 ---*/
-            fStep = g_stCtrl.f32RpmRamp * (FOC_2PI * (float)MOTOR_POLE_PAIRS / 60.0f) * FOC_CTRL_TS;
-            g_stMotor.f32Theta = fwrap_2pi(g_stMotor.f32Theta + fStep);
+            g_stCtrl.f32IqRef = FOC_IF_STARTUP_IQ;
         }
+        g_stCtrl.f32IdRef = 0.0f;
+
+        /*--- 先爬到 600rpm，保持 2s，再继续爬到最终目标 ---*/
+        if (g_stCtrl.u32SettleFrames < FOC_IF_SETTLE_FRAMES)
+        {
+            fRpmLimit = FOC_IF_SWITCH_RPM;
+        }
+        else
+        {
+            fRpmLimit = g_stCtrl.f32TargetRpm;
+        }
+
+        if (fRpmLimit > g_stCtrl.f32TargetRpm)
+        {
+            fRpmLimit = g_stCtrl.f32TargetRpm;
+        }
+
+        if ((g_stCtrl.f32RpmRamp < fRpmLimit) &&
+            ((g_stCtrl.u32RampCount % FOC_IF_RAMP_INTERVAL) == 0U))
+        {
+            g_stCtrl.f32RpmRamp += FOC_IF_RAMP_STEP_RPM;
+            if (g_stCtrl.f32RpmRamp > fRpmLimit)
+            {
+                g_stCtrl.f32RpmRamp = fRpmLimit;
+            }
+        }
+
+        if (g_stCtrl.f32RpmRamp >= FOC_IF_SWITCH_RPM)
+        {
+            g_stCtrl.u32SettleFrames++;
+        }
+
+        fStep = g_stCtrl.f32RpmRamp * (FOC_2PI * (float)MOTOR_POLE_PAIRS / 60.0f) * FOC_CTRL_TS;
+        g_stMotor.f32Theta = fwrap_2pi(g_stMotor.f32Theta + fStep);
 
         g_stCtrl.u32RampCount++;
         break;
@@ -424,7 +433,7 @@ void FOC_ControlStep(void)
              g_stMotor.f32Theta, &g_stMotor.f32Id, &g_stMotor.f32Iq);
 
     /*--- 第3步：速度电压前馈 + 小幅电流修正 ---
-     * 开环运行时，反电势主电压由速度模型给出；PI 只补偿电阻压降、采样误差和负载扰动。
+     * 开环角度不是真实转子角时，不能让电流 PI 主导输出，否则会在错误 dq 坐标中拉大电流。
      */
     fUdPi = FOC_PI_Run(&g_stPiId, g_stCtrl.f32IdRef, g_stMotor.f32Id);
     fUqPi = FOC_PI_Run(&g_stPiIq, g_stCtrl.f32IqRef, g_stMotor.f32Iq);
@@ -464,13 +473,13 @@ void FOC_GetPhaseCurrent(void)
     uint16_t u16IaRaw, u16IbRaw;
     float fIa, fIb;
 
-    /* 禁止 CH4 触发，防重入 */
-    TIM1->CCER &= ~TIM_CCER_CC4E;
+    // /* 禁止 CH4 触发，防重入 */
+    // TIM1->CCER &= ~TIM_CCER_CC4E;这里是个bug，不注释的话会第二次启动失败，因为adc中断被关了
 
     u16IaRaw = (uint16_t)(ADC1->JDR1);
     u16IbRaw = (uint16_t)(ADC2->JDR1);
 
-    /* current_pu = polarity * (raw - offset) / scale */
+    /* 验证版硬件电流方向为 offset - raw，这里用 polarity 保持坐标系一致。 */
     fIa = FOC_CURRENT_POLARITY_A * ((float)u16IaRaw - FOC_fIaOffsetAdc) / FOC_ADC_CURRENT_SCALE;
     fIb = FOC_CURRENT_POLARITY_B * ((float)u16IbRaw - FOC_fIbOffsetAdc) / FOC_ADC_CURRENT_SCALE;
 
