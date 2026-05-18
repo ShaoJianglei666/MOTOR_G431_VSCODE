@@ -30,6 +30,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define SPEED_RUN  1200    /* 目标转速 (RPM) */
+#define SPEED_STEP_RPM  50.0f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -320,6 +321,22 @@ int main(void)
         {
             Motor_Start();
         }
+    }
+
+    /*--- 闭环后单击 PC9：目标速度 +50rpm ---*/
+    if (KEY_GetEvent(KEY_ID_SPEED_UP) == KEY_EVENT_PRESS)
+    {
+#if !FOC_FORCE_OPEN_LOOP
+        if (s_u8MotorRunning && (g_stCtrl.eMode == FOC_MODE_CLOSED_LOOP))
+        {
+            float fNewTarget = g_stCtrl.f32TargetRpm + SPEED_STEP_RPM;
+            if (fNewTarget > FOC_OBS_MAX_SPEED_RPM)
+            {
+                fNewTarget = FOC_OBS_MAX_SPEED_RPM;
+            }
+            g_stCtrl.f32TargetRpm = fNewTarget;
+        }
+#endif
     }
 
     /*--- LED1 (PB12) 以 1Hz 闪烁 ---*/

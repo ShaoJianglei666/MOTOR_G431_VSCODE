@@ -38,6 +38,8 @@ extern "C" {
 /* 按键引脚定义（外部上拉，按下=低电平） */
 #define KEY_RUN_PIN     GPIO_PIN_8
 #define KEY_RUN_PORT    GPIOC
+#define KEY_SPEED_UP_PIN   GPIO_PIN_9
+#define KEY_SPEED_UP_PORT  GPIOC
 /* USER CODE END Private defines */
 
 void MX_GPIO_Init(void);

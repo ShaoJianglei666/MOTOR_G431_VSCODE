@@ -26,6 +26,7 @@ extern "C" {
 typedef enum
 {
     KEY_ID_RUN  = 0,
+    KEY_ID_SPEED_UP,
     KEY_ID_COUNT
 } Key_Id;
 

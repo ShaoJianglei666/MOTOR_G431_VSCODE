@@ -36,7 +36,8 @@ typedef struct
 
 static Key_Ctx s_astKeys[KEY_ID_COUNT] =
 {
-    [KEY_ID_RUN]  = { KEY_RUN_PORT,  KEY_RUN_PIN,  KEY_ST_IDLE, 1, 1, 0, KEY_EVENT_NONE },
+    [KEY_ID_RUN]      = { KEY_RUN_PORT,      KEY_RUN_PIN,      KEY_ST_IDLE, 1, 1, 0, KEY_EVENT_NONE },
+    [KEY_ID_SPEED_UP] = { KEY_SPEED_UP_PORT, KEY_SPEED_UP_PIN, KEY_ST_IDLE, 1, 1, 0, KEY_EVENT_NONE },
 };
 
 /* Exported functions --------------------------------------------------------*/

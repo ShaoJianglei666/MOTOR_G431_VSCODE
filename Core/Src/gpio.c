@@ -57,11 +57,11 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   // HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PC8 */
-  GPIO_InitStruct.Pin = KEY_RUN_PIN;
+  /*Configure GPIO pins : PC8 PC9 */
+  GPIO_InitStruct.Pin = KEY_RUN_PIN | KEY_SPEED_UP_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(KEY_RUN_PORT, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PB12 */
   GPIO_InitStruct.Pin = LED_PIN;

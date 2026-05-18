@@ -59,14 +59,20 @@ extern "C" {
 #define FOC_CURRENT_POLARITY_B     (-1.0f)
 
 /*--- IF 开环参数 ---*/
+#define FOC_FORCE_OPEN_LOOP         1         /**< 1=只运行开环调试, 0=允许切换闭环 */
 #define FOC_IF_ALIGN_ID             0.0f      /**< 参考启动阶段不做静止 Id 对齐 */
-#define FOC_IF_IQ_START             0.05f     /**< Iq 软启动起点 (pu) */
-#define FOC_IF_STARTUP_IQ           0.09f     /**< IF 启动 Iq 参考 (pu), 约 0.18A@2A base */
+#define FOC_IF_IQ_START             0.1526f   /**< Iq 软启动起点 (pu), =5000/32768 */
+#define FOC_IF_STARTUP_IQ           0.0916f   /**< IF 启动 Iq 参考 (pu), =3000/32768 */
 #define FOC_IF_IQ_RAMP_FRAMES       1000U     /**< Iq 软启动时间 (100ms@10kHz) */
-#define FOC_IF_SWITCH_RPM           600.0f    /**< 参考代码启动阶段先到 600rpm */
-#define FOC_IF_SETTLE_FRAMES        20000U    /**< 600rpm 恒速等待 (2s@10kHz) */
+#define FOC_IF_SWITCH_RPM           1200.0f   /**< 本工程闭环切换转速 (RPM) */
+#define FOC_IF_SETTLE_FRAMES        20000U    /**< 切换转速恒速等待 (2s@10kHz) */
 #define FOC_IF_RAMP_STEP_RPM        50.0f     /**< 加速步长 (RPM) */
 #define FOC_IF_RAMP_INTERVAL        800U      /**< 加速间隔 (帧, 80ms@10kHz) */
+#define FOC_IF_SPEED_TOL_PCT        10U       /**< 观测速度容差百分比 (±10%) */
+#define FOC_IF_STABLE_COUNT_THR     500U      /**< 速度稳定判定连续帧数 (50ms@10kHz) */
+#define FOC_TRANSITION_FRAMES       5000U     /**< 角度渐进切换帧数 (500ms@10kHz) */
+#define FOC_CLOSED_STABLE_FRAMES    20000U    /**< 闭环切换后失锁屏蔽帧数 (2s@10kHz) */
+#define FOC_OBS_LOST_THRESHOLD      5000U     /**< 观测器失锁保护帧数 (500ms@10kHz) */
 
 /*--- 电压前馈参数（基于 Motor_Param.h） ---*/
 /** @brief 电流基值 (A) */
@@ -105,6 +111,11 @@ extern "C" {
 #define FOC_PI_ID_KI                0.001f
 #define FOC_PI_IQ_KP                0.05f
 #define FOC_PI_IQ_KI                0.001f
+#define FOC_PI_SPEED_KP             0.00001863f  /**< 约 2500/(4096*32768), RPM -> Iq pu */
+#define FOC_PI_SPEED_KI             0.0000000745f /**< 约 10/(4096*32768), RPM -> Iq pu */
+#define FOC_PI_SPEED_OUT_MAX        0.9155f      /**< 速度环 Iq 上限, =30000/32768 */
+#define FOC_PI_SPEED_OUT_MIN       (-0.9155f)
+#define FOC_SPEED_LOOP_DECIMATION   20U          /**< 速度环 10kHz/20=500Hz */
 
 /*--- 正弦查找表 ---*/
 #define FOC_SIN_TABLE_SIZE          256U
@@ -139,7 +150,10 @@ typedef struct
 typedef enum
 {
     FOC_MODE_STOP        = 0,   /**< 停止 */
-    FOC_MODE_IF_OPENLOOP = 1    /**< IF 开环运行 */
+    FOC_MODE_IF_OPENLOOP = 1,   /**< IF 开环运行 */
+    FOC_MODE_TRANSITION  = 2,   /**< 开环角度到观测角度渐变 */
+    FOC_MODE_CLOSED_LOOP = 3,   /**< 速度闭环运行 */
+    FOC_MODE_FAULT       = 4    /**< 故障保护 */
 } FOC_Mode;
 
 /**
@@ -155,6 +169,14 @@ typedef struct
     uint32_t  u32RampCount;     /**< 斜坡计数器（帧） */
     uint32_t  u32RunFrames;     /**< 总运行帧数（诊断） */
     uint32_t  u32SettleFrames;  /**< 达到切换转速后的恒速等待帧数 */
+    uint32_t  u32SpeedStableCount; /**< 观测速度稳定连续计数 */
+    uint32_t  u32BlendCount;    /**< 角度渐变计数器 */
+    uint32_t  u32SwitchStableCount; /**< 闭环切换后稳定计数 */
+    uint32_t  u32ObsLostCount;  /**< 观测器失锁计数 */
+    float     f32ThetaErrSave;  /**< 过渡开始时 θobs - θif 的带符号误差 (rad) */
+    float     f32ThetaIfRef;    /**< 过渡开始时 IF 角度 (rad) */
+    float     f32TorqueAngle;   /**< 观测角度相对控制角度的正向角差 (rad) */
+    uint16_t  u16DiagTransitionFlag; /**< 诊断：过渡阶段标志 */
 } FOC_ControlState;
 
 /**
@@ -189,6 +211,7 @@ extern FOC_MotorState    g_stMotor;
 extern FOC_ControlState  g_stCtrl;
 extern FOC_PI            g_stPiId;
 extern FOC_PI            g_stPiIq;
+extern FOC_PI            g_stPiSpeed;
 extern FOC_Luenberger    g_stLuenberger;
 extern float             FOC_fIaOffsetAdc;
 extern float             FOC_fIbOffsetAdc;

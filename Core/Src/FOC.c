@@ -68,6 +68,13 @@ static inline float fwrap_2pi(float theta)
     return theta;
 }
 
+static inline float fwrap_pi(float theta)
+{
+    while (theta >= FOC_MATH_PI) theta -= FOC_2PI;
+    while (theta < -FOC_MATH_PI) theta += FOC_2PI;
+    return theta;
+}
+
 static inline void flimit_vector(float *x, float *y, float limit)
 {
     float mag_sq = (*x * *x) + (*y * *y);
@@ -110,6 +117,7 @@ FOC_MotorState   g_stMotor;
 FOC_ControlState g_stCtrl;
 FOC_PI           g_stPiId;
 FOC_PI           g_stPiIq;
+FOC_PI           g_stPiSpeed;
 FOC_Luenberger   g_stLuenberger;
 float            FOC_fIaOffsetAdc = 1972.0f;
 float            FOC_fIbOffsetAdc = 1972.0f;
@@ -231,6 +239,13 @@ void FOC_Init(void)
     g_stPiIq.fIntegral = 0.0f;
     g_stPiIq.fOutMax   =  FOC_PI_CORRECTION_MAX_PU;
     g_stPiIq.fOutMin   = -FOC_PI_CORRECTION_MAX_PU;
+
+    /* Speed PI: output is Iq reference (pu). */
+    g_stPiSpeed.fKp       = FOC_PI_SPEED_KP;
+    g_stPiSpeed.fKi       = FOC_PI_SPEED_KI;
+    g_stPiSpeed.fIntegral = 0.0f;
+    g_stPiSpeed.fOutMax   =  FOC_PI_SPEED_OUT_MAX;
+    g_stPiSpeed.fOutMin   =  FOC_PI_SPEED_OUT_MIN;
 }
 
 /*============================================================================*/
@@ -239,7 +254,6 @@ void FOC_Init(void)
 static void FOC_StateMachine_Run(void)
 {
     float fStep;
-    float fRpmLimit;
 
     switch (g_stCtrl.eMode)
     {
@@ -251,10 +265,16 @@ static void FOC_StateMachine_Run(void)
             g_stCtrl.u32RampCount = 0;
             g_stCtrl.u32RunFrames = 0;
             g_stCtrl.u32SettleFrames = 0;
+            g_stCtrl.u32SpeedStableCount = 0;
+            g_stCtrl.u32BlendCount = 0;
+            g_stCtrl.u32SwitchStableCount = 0;
+            g_stCtrl.u32ObsLostCount = 0;
+            g_stCtrl.u16DiagTransitionFlag = 0;
             g_stMotor.f32Theta    = 0.0f;
 
             g_stPiId.fIntegral = 0.0f;
             g_stPiIq.fIntegral = 0.0f;
+            g_stPiSpeed.fIntegral = 0.0f;
 
             g_stCtrl.eMode = FOC_MODE_IF_OPENLOOP;
         }
@@ -282,30 +302,27 @@ static void FOC_StateMachine_Run(void)
         }
         g_stCtrl.f32IdRef = 0.0f;
 
-        /*--- 先爬到 600rpm，保持 2s，再继续爬到最终目标 ---*/
-        if (g_stCtrl.u32SettleFrames < FOC_IF_SETTLE_FRAMES)
-        {
-            fRpmLimit = FOC_IF_SWITCH_RPM;
-        }
-        else
-        {
-            fRpmLimit = g_stCtrl.f32TargetRpm;
-        }
-
-        if (fRpmLimit > g_stCtrl.f32TargetRpm)
-        {
-            fRpmLimit = g_stCtrl.f32TargetRpm;
-        }
-
-        if ((g_stCtrl.f32RpmRamp < fRpmLimit) &&
+#if FOC_FORCE_OPEN_LOOP
+        if ((g_stCtrl.f32RpmRamp < g_stCtrl.f32TargetRpm) &&
             ((g_stCtrl.u32RampCount % FOC_IF_RAMP_INTERVAL) == 0U))
         {
             g_stCtrl.f32RpmRamp += FOC_IF_RAMP_STEP_RPM;
-            if (g_stCtrl.f32RpmRamp > fRpmLimit)
+            if (g_stCtrl.f32RpmRamp > g_stCtrl.f32TargetRpm)
             {
-                g_stCtrl.f32RpmRamp = fRpmLimit;
+                g_stCtrl.f32RpmRamp = g_stCtrl.f32TargetRpm;
             }
         }
+#else
+        if ((g_stCtrl.f32RpmRamp < FOC_IF_SWITCH_RPM) &&
+            ((g_stCtrl.u32RampCount % FOC_IF_RAMP_INTERVAL) == 0U))
+        {
+            g_stCtrl.f32RpmRamp += FOC_IF_RAMP_STEP_RPM;
+            if (g_stCtrl.f32RpmRamp > FOC_IF_SWITCH_RPM)
+            {
+                g_stCtrl.f32RpmRamp = FOC_IF_SWITCH_RPM;
+            }
+        }
+#endif
 
         if (g_stCtrl.f32RpmRamp >= FOC_IF_SWITCH_RPM)
         {
@@ -315,9 +332,139 @@ static void FOC_StateMachine_Run(void)
         fStep = g_stCtrl.f32RpmRamp * (FOC_2PI * (float)MOTOR_POLE_PAIRS / 60.0f) * FOC_CTRL_TS;
         g_stMotor.f32Theta = fwrap_2pi(g_stMotor.f32Theta + fStep);
 
+#if !FOC_FORCE_OPEN_LOOP
+        if (g_stCtrl.u32SettleFrames >= FOC_IF_SETTLE_FRAMES)
+        {
+            float fTol = FOC_IF_SWITCH_RPM * (float)FOC_IF_SPEED_TOL_PCT / 100.0f;
+            uint8_t u8SpeedOk = ((g_stLuenberger.f32SpeedObs > (FOC_IF_SWITCH_RPM - fTol)) &&
+                                 (g_stLuenberger.f32SpeedObs < (FOC_IF_SWITCH_RPM + fTol))) ? 1U : 0U;
+
+            if (u8SpeedOk)
+            {
+                g_stCtrl.u32SpeedStableCount++;
+                if (g_stCtrl.u32SpeedStableCount >= FOC_IF_STABLE_COUNT_THR)
+                {
+                    g_stCtrl.f32ThetaErrSave = fwrap_pi(g_stLuenberger.f32ThetaObs - g_stMotor.f32Theta);
+                    g_stCtrl.f32ThetaIfRef = g_stMotor.f32Theta;
+                    g_stCtrl.u32BlendCount = 0;
+                    g_stCtrl.u16DiagTransitionFlag = 1U;
+                    g_stCtrl.eMode = FOC_MODE_TRANSITION;
+                }
+            }
+            else
+            {
+                g_stCtrl.u32SpeedStableCount = 0;
+            }
+        }
+#endif
+
+        g_stCtrl.f32TorqueAngle = fwrap_2pi(g_stLuenberger.f32ThetaObs - g_stMotor.f32Theta);
         g_stCtrl.u32RampCount++;
         break;
     }
+
+    case FOC_MODE_TRANSITION:
+    {
+        float fCnt;
+        float fRemain;
+
+        if (g_stCtrl.f32TargetRpm == 0.0f)
+        {
+            g_stCtrl.eMode = FOC_MODE_STOP;
+            break;
+        }
+
+        g_stCtrl.u32BlendCount++;
+        fCnt = (float)g_stCtrl.u32BlendCount;
+        if (fCnt > (float)FOC_TRANSITION_FRAMES)
+        {
+            fCnt = (float)FOC_TRANSITION_FRAMES;
+        }
+
+        fRemain = g_stCtrl.f32ThetaErrSave
+                * ((float)FOC_TRANSITION_FRAMES - fCnt)
+                / (float)FOC_TRANSITION_FRAMES;
+        g_stMotor.f32Theta = fwrap_2pi(g_stLuenberger.f32ThetaObs - fRemain);
+        g_stCtrl.f32TorqueAngle = fwrap_2pi(g_stLuenberger.f32ThetaObs - g_stMotor.f32Theta);
+
+        g_stCtrl.f32IdRef = 0.0f;
+        g_stCtrl.f32IqRef = FOC_IF_STARTUP_IQ;
+
+        if (g_stCtrl.u32BlendCount >= FOC_TRANSITION_FRAMES)
+        {
+            float fSpdErr;
+            float fKpTerm;
+            float fCurSpd;
+            float fIqEst;
+
+            g_stMotor.f32Theta = g_stLuenberger.f32ThetaObs;
+
+            fSpdErr = g_stCtrl.f32TargetRpm - g_stLuenberger.f32SpeedObs;
+            fKpTerm = FOC_PI_SPEED_KP * fSpdErr;
+
+            fCurSpd = g_stLuenberger.f32SpeedObs;
+            if (fCurSpd < 1.0f)
+            {
+                fCurSpd = 1.0f;
+            }
+
+            fIqEst = g_stCtrl.f32IqRef * FOC_IF_SWITCH_RPM / fCurSpd;
+            if (fIqEst > g_stCtrl.f32IqRef)
+            {
+                fIqEst = g_stCtrl.f32IqRef;
+            }
+            if (fIqEst < 0.0305f)
+            {
+                fIqEst = 0.0305f;
+            }
+
+            g_stPiSpeed.fIntegral = fclamp(fIqEst - fKpTerm,
+                                           g_stPiSpeed.fOutMin,
+                                           g_stPiSpeed.fOutMax);
+
+            g_stCtrl.eMode = FOC_MODE_CLOSED_LOOP;
+            g_stCtrl.u16DiagTransitionFlag = 0U;
+            g_stCtrl.u32SwitchStableCount = 0;
+            g_stCtrl.u32ObsLostCount = 0;
+        }
+        break;
+    }
+
+    case FOC_MODE_CLOSED_LOOP:
+        if (g_stCtrl.f32TargetRpm == 0.0f)
+        {
+            g_stCtrl.eMode = FOC_MODE_STOP;
+            break;
+        }
+
+        g_stMotor.f32Theta = g_stLuenberger.f32ThetaObs;
+        g_stCtrl.f32IdRef = 0.0f;
+        g_stCtrl.f32RpmRamp = g_stCtrl.f32TargetRpm;
+
+        if (g_stCtrl.u32SwitchStableCount < FOC_CLOSED_STABLE_FRAMES)
+        {
+            g_stCtrl.u32SwitchStableCount++;
+        }
+        else if (!g_stLuenberger.u16Locked)
+        {
+            g_stCtrl.u32ObsLostCount++;
+            if (g_stCtrl.u32ObsLostCount >= FOC_OBS_LOST_THRESHOLD)
+            {
+                g_stCtrl.eMode = FOC_MODE_STOP;
+                g_stCtrl.f32TargetRpm = 0.0f;
+                g_stPiId.fIntegral = 0.0f;
+                g_stPiIq.fIntegral = 0.0f;
+                g_stPiSpeed.fIntegral = 0.0f;
+            }
+        }
+        else
+        {
+            g_stCtrl.u32ObsLostCount = 0;
+        }
+        break;
+
+    case FOC_MODE_FAULT:
+        break;
     }
 }
 
@@ -407,6 +554,9 @@ void FOC_Luenberger_Run(void)
 /*============================================================================*/
 void FOC_ControlStep(void)
 {
+#if !FOC_FORCE_OPEN_LOOP
+    static uint16_t s_u16SpeedLoopCnt = 0U;
+#endif
     float fUdPi;
     float fUqPi;
     float fUqFf;
@@ -416,13 +566,35 @@ void FOC_ControlStep(void)
     FOC_StateMachine_Run();
 
     /*--- STOP：输出 50% 占空比 ---*/
-    if (g_stCtrl.eMode == FOC_MODE_STOP)
+    if ((g_stCtrl.eMode == FOC_MODE_STOP) || (g_stCtrl.eMode == FOC_MODE_FAULT))
     {
+#if !FOC_FORCE_OPEN_LOOP
+        s_u16SpeedLoopCnt = 0U;
+#endif
         TIM1->CCR1 = PWM_HALF_CYCLE;
         TIM1->CCR2 = PWM_HALF_CYCLE;
         TIM1->CCR3 = PWM_HALF_CYCLE;
         return;
     }
+
+    /*--- 闭环速度 PI：输出 IqRef，参考工程为 500Hz 分频执行 ---*/
+#if !FOC_FORCE_OPEN_LOOP
+    if (g_stCtrl.eMode == FOC_MODE_CLOSED_LOOP)
+    {
+        s_u16SpeedLoopCnt++;
+        if (s_u16SpeedLoopCnt >= FOC_SPEED_LOOP_DECIMATION)
+        {
+            s_u16SpeedLoopCnt = 0U;
+            g_stCtrl.f32IqRef = FOC_PI_Run(&g_stPiSpeed,
+                                           g_stCtrl.f32TargetRpm,
+                                           g_stLuenberger.f32SpeedObs);
+        }
+    }
+    else
+    {
+        s_u16SpeedLoopCnt = 0U;
+    }
+#endif
 
     /*--- 第1步：Clarke ---*/
     FOC_Clarke(g_stMotor.f32Ia, g_stMotor.f32Ib,
