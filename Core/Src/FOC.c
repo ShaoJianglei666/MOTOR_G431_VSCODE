@@ -225,13 +225,15 @@ static float FOC_SpeedPI_Run(FOC_PI *pstPi, float fRefRpm, float fFbRpm)
     float fErr = fRefRpm - fFbRpm;
     float fOut;
     float fIntDelta;
+#if FOC_PI_SPEED_ENHANCED
     float fStep;
-
+    /*--- [增强] 误差死区：小误差强制归零，避免零点附近抖动 ---*/
     if ((fErr < FOC_PI_SPEED_ERR_DEADBAND_RPM) &&
         (fErr > -FOC_PI_SPEED_ERR_DEADBAND_RPM))
     {
         fErr = 0.0f;
     }
+#endif
 
     pstPi->fProportional = pstPi->fKp * fErr;
 
@@ -244,6 +246,8 @@ static float FOC_SpeedPI_Run(FOC_PI *pstPi, float fRefRpm, float fFbRpm)
         pstPi->fIntegral += fIntDelta;
     }
 
+#if FOC_PI_SPEED_ENHANCED
+    /*--- [增强] 积分反向泄放：误差和积分异号时快速拉回，防止超调后积分惯性 ---*/
     if ((fErr < 0.0f) && (pstPi->fIntegral > 0.0f))
     {
         pstPi->fIntegral += FOC_PI_SPEED_UNWIND_KP * fErr;
@@ -252,6 +256,7 @@ static float FOC_SpeedPI_Run(FOC_PI *pstPi, float fRefRpm, float fFbRpm)
     {
         pstPi->fIntegral += FOC_PI_SPEED_UNWIND_KP * fErr;
     }
+#endif
 
     pstPi->fIntegral = fclamp(pstPi->fIntegral,
                               pstPi->fOutMin,
@@ -260,15 +265,18 @@ static float FOC_SpeedPI_Run(FOC_PI *pstPi, float fRefRpm, float fFbRpm)
     fOut = pstPi->fProportional + pstPi->fIntegral;
     fOut = fclamp(fOut, pstPi->fOutMin, pstPi->fOutMax);
 
+#if FOC_PI_SPEED_ENHANCED
+    /*--- [增强] 输出斜率限制：防止 IqRef 突变导致电流冲击 ---*/
     fStep = fOut - pstPi->fOutPrev;
-    if (fStep > FOC_PI_SPEED_SLEW_UP_Q12)
+    if (fStep > FOC_PI_SPEED_SLEW_UP)
     {
-        fOut = pstPi->fOutPrev + FOC_PI_SPEED_SLEW_UP_Q12;
+        fOut = pstPi->fOutPrev + FOC_PI_SPEED_SLEW_UP;
     }
-    else if (fStep < -FOC_PI_SPEED_SLEW_DOWN_Q12)
+    else if (fStep < -FOC_PI_SPEED_SLEW_DOWN)
     {
-        fOut = pstPi->fOutPrev - FOC_PI_SPEED_SLEW_DOWN_Q12;
+        fOut = pstPi->fOutPrev - FOC_PI_SPEED_SLEW_DOWN;
     }
+#endif
 
     fOut = fclamp(fOut, pstPi->fOutMin, pstPi->fOutMax);
     pstPi->fOutPrev = fOut;
@@ -523,8 +531,8 @@ static void FOC_StateMachine_Run(void)
             g_stPiSpeed.fOutMax = FOC_PI_SPEED_OUT_MAX;
             g_stPiSpeed.fOutMin = FOC_PI_SPEED_OUT_MIN;
             g_stPiSpeed.fErrPrev = g_stCtrl.f32RampedTargetRpm - g_stLuenberger.f32SpeedObs;
-            g_stPiSpeed.fOutPrev = FOC_PU_TO_Q12(fIqPreload);
-            g_stPiSpeed.fIntegral = FOC_PU_TO_Q12(fIqPreload);
+            g_stPiSpeed.fOutPrev = fIqPreload;
+            g_stPiSpeed.fIntegral = fIqPreload;
             g_stPiSpeed.fProportional = FOC_PI_SPEED_KP * g_stPiSpeed.fErrPrev;
 
             /* 不设置 f32IqRef：保持过渡阶段值，直到速度 PI 在下一 500Hz 周期自然接管输出 */
@@ -552,8 +560,8 @@ static void FOC_StateMachine_Run(void)
             g_stPiIq.fIntegral = g_stPiIq.fOutPrev;
             g_stPiIq.fProportional = g_stPiIq.fKp * g_stPiIq.fErrPrev;
 
-            g_stCtrl.f32SpdProportional = FOC_Q12_TO_PU(g_stPiSpeed.fProportional);
-            g_stCtrl.f32SpdIntegral = FOC_Q12_TO_PU(g_stPiSpeed.fIntegral);
+            g_stCtrl.f32SpdProportional = g_stPiSpeed.fProportional;
+            g_stCtrl.f32SpdIntegral = g_stPiSpeed.fIntegral;
 
             g_stCtrl.eMode = FOC_MODE_CLOSED_LOOP;
             g_stCtrl.u16DiagTransitionFlag = 0U;
@@ -762,19 +770,19 @@ void FOC_ControlStep(void)
                 }
             }
 
-            /* 速度 PI 输出为 Q12 计数，换算为 pu 后再作为电流环 IqRef。 */
+            /* 速度 PI 直接输出 pu 值作为电流环 IqRef。 */
             g_stPiSpeed.fOutMax = FOC_PI_SPEED_OUT_MAX;
             g_stPiSpeed.fOutMin = FOC_PI_SPEED_OUT_MIN;
-            g_stCtrl.f32IqRef = FOC_Q12_TO_PU(FOC_SpeedPI_Run(&g_stPiSpeed,
-                                                              g_stCtrl.f32RampedTargetRpm,
-                                                              g_stLuenberger.f32SpeedObs));//这里不用除以4096
+            g_stCtrl.f32IqRef = FOC_SpeedPI_Run(&g_stPiSpeed,
+                                                g_stCtrl.f32RampedTargetRpm,
+                                                g_stLuenberger.f32SpeedObs);
             g_stCtrl.f32IqRef = fclamp(g_stCtrl.f32IqRef,
                                        -FOC_CLOSED_IQ_REF_MAX,
                                         FOC_CLOSED_IQ_REF_MAX);
 
             /* 诊断输出 */
-            g_stCtrl.f32SpdProportional = FOC_Q12_TO_PU(g_stPiSpeed.fProportional);
-            g_stCtrl.f32SpdIntegral     = FOC_Q12_TO_PU(g_stPiSpeed.fIntegral);
+            g_stCtrl.f32SpdProportional = g_stPiSpeed.fProportional;
+            g_stCtrl.f32SpdIntegral     = g_stPiSpeed.fIntegral;
         }
     }
     else

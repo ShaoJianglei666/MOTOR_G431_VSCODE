@@ -125,20 +125,29 @@ extern "C" {
 #define FOC_PI_ID_KI                0.001f
 #define FOC_PI_IQ_KP                0.05f
 #define FOC_PI_IQ_KI                0.001f
-/*--- PI 速度环增益（按参考工程 Q12：K_float = K_q12 / 4096） ---*/
-#define FOC_PI_SPEED_KP             0.910f      /**< 2500/4096, 输出单位为Q12计数 */
-#define FOC_PI_SPEED_KI             0.00044f    /**< 10/4096, 输出单位为Q12计数 */
-#define FOC_CLOSED_IQ_REF_MAX_Q12   800.0f      /**< 闭环 IqRef 上限 (Q12计数, 约0.39A@2A基值) */
-#define FOC_PI_SPEED_OUT_MAX        FOC_CLOSED_IQ_REF_MAX_Q12
-#define FOC_PI_SPEED_OUT_MIN        (-FOC_CLOSED_IQ_REF_MAX_Q12)
-#define FOC_CLOSED_IQ_REF_MAX       FOC_Q12_TO_PU(FOC_CLOSED_IQ_REF_MAX_Q12)
-#define FOC_PI_SPEED_ERR_DEADBAND_RPM 2.0f    /**< 速度环误差死区，防止零点附近抖动 */
-#define FOC_PI_SPEED_UNWIND_KP      0.05f     /**< 过速/欠速时反向积分软泄放系数 (Q12计数/RPM) */
-#define FOC_PI_SPEED_SLEW_UP_Q12    12.0f     /**< 速度PI输出上升斜率限制 (Q12计数/速度环周期) */
-#define FOC_PI_SPEED_SLEW_DOWN_Q12  8.0f      /**< 速度PI输出下降斜率限制 (Q12计数/速度环周期) */
+/*--- PI 速度环增益（纯浮点 pu，不再使用 Q12 定点） ---*/
+/**
+  * @brief 速度 PI 增强特性开关
+  *   1 = 启用增强特性（死区 + 积分反向泄放 + 输出斜率限制）
+  *   0 = 纯增量式 PI，与参考工程 FOC_PID_Run 逻辑一致，便于对比验证
+  */
+//#define FOC_PI_SPEED_ENHANCED       1
+
+#define FOC_PI_SPEED_KP             0.44f   
+#define FOC_PI_SPEED_KI             0.00094f 
+#define FOC_CLOSED_IQ_REF_MAX_Q12   800.0f      /**< 闭环 IqRef 上限 (Q12计数, 仅常量定义用) */
+#define FOC_CLOSED_IQ_REF_MAX       FOC_Q12_TO_PU(FOC_CLOSED_IQ_REF_MAX_Q12) /**< 闭环 IqRef 上限 (pu) */
+#define FOC_PI_SPEED_OUT_MAX        FOC_CLOSED_IQ_REF_MAX       /**< 速度PI输出上限 (pu) */
+#define FOC_PI_SPEED_OUT_MIN        (-FOC_CLOSED_IQ_REF_MAX)    /**< 速度PI输出下限 (pu) */
+#if FOC_PI_SPEED_ENHANCED
+#define FOC_PI_SPEED_ERR_DEADBAND_RPM 2.0f    /**< [增强] 速度环误差死区，防止零点附近抖动 */
+#define FOC_PI_SPEED_UNWIND_KP      (0.05f / 4096.0f)  /**< [增强] 过速/欠速时反向积分软泄放系数 (pu/RPM) */
+#define FOC_PI_SPEED_SLEW_UP        (12.0f / 4096.0f)  /**< [增强] 速度PI输出上升斜率限制 (pu/速度环周期) */
+#define FOC_PI_SPEED_SLEW_DOWN      (8.0f / 4096.0f)   /**< [增强] 速度PI输出下降斜率限制 (pu/速度环周期) */
+#endif
 #define FOC_SPEED_LOOP_DECIMATION   20U          /**< 速度环 10kHz/20=500Hz */
 #define FOC_SPEED_RAMP_DIV          10U          /**< 每 10 个速度 PI 周期更新一次目标斜坡 */
-#define FOC_SPEED_RAMP_STEP_RPM     2.0f         /**< 目标转速斜坡步长, 约 100rpm/s */
+#define FOC_SPEED_RAMP_STEP_RPM     5.0f         /**< 目标转速斜坡步长, 约 20rpm/s */
 
 /*--- 正弦查找表 ---*/
 #define FOC_SIN_TABLE_SIZE          256U
