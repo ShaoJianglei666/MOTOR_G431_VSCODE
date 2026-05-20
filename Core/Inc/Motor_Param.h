@@ -34,43 +34,43 @@ extern "C" {
   * @brief 电机极对数
   *        电气角度 = 机械角度 × MOTOR_POLE_PAIRS
   */
-#define MOTOR_POLE_PAIRS               2U
+#define MOTOR_POLE_PAIRS               4U
 
 /**
   * @brief 直流母线电压 (V)
   */
-#define MOTOR_BUS_VOLTAGE              24.0f
+#define MOTOR_BUS_VOLTAGE              60.0f
 
 /**
   * @brief 额定转矩 (Nm)
   */
-#define MOTOR_RATED_TORQUE_NM          0.18f
+#define MOTOR_RATED_TORQUE_NM          6.45f
 
 /**
   * @brief 相电阻 (Ω)
   */
-#define MOTOR_PHASE_RESISTANCE         0.575f
+#define MOTOR_PHASE_RESISTANCE         0.006f
 
 /**
   * @brief 相电感 (H)
   */
-#define MOTOR_PHASE_INDUCTANCE         0.00105f
+#define MOTOR_PHASE_INDUCTANCE         0.000035f
 
 /**
   * @brief 反电势系数 (V_peak L-L / krpm)
   *        线线反电势峰值 / 机械转速 (kRPM)
   */
-#define MOTOR_BEMF_CONST_V_LL          5.96708f
+#define MOTOR_BEMF_CONST_V_LL          8.6961f
 
 /**
   * @brief 转动惯量 (kg·m²)
   */
-#define MOTOR_INERTIA_KGM2             0.0000075f
+#define MOTOR_INERTIA_KGM2             0.0046f
 
 /**
   * @brief 阻尼系数 (N·m·s)
   */
-#define MOTOR_DAMPING_NMS              0.0000063f
+#define MOTOR_DAMPING_NMS              0.0000915f
 
 #ifdef __cplusplus
 }

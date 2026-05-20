@@ -110,6 +110,38 @@ static inline void f32_sincos_lut(float theta, float *sin_val, float *cos_val)
 }
 
 /*============================================================================*/
+/* DAC 调试输出（PA4, 0~4095）                                                  */
+/*============================================================================*/
+void FOC_DAC_Output(float fValue)
+{
+    float fOut;
+
+    switch (FOC_DAC_CHANNEL_ID) {
+    case 0:  fOut = g_stMotor.f32Ia;              break;
+    case 1:  fOut = g_stMotor.f32Ib;              break;
+    case 2:  fOut = g_stMotor.f32Id;              break;
+    case 3:  fOut = g_stMotor.f32Iq;              break;
+    case 4:  fOut = g_stMotor.f32Valpha;           break;
+    case 5:  fOut = g_stMotor.f32Vbeta;            break;
+    case 6:  fOut = g_stLuenberger.f32Ealpha;      break;
+    case 7:  fOut = g_stLuenberger.f32Ebeta;       break;
+    case 8:  fOut = g_stMotor.f32Theta / FOC_2PI;  break;
+    case 9:  fOut = g_stLuenberger.f32ThetaObs / FOC_2PI; break;
+    case 10: fOut = g_stLuenberger.f32SpeedObs / FOC_OBS_MAX_SPEED_RPM; break;
+    case 11: fOut = g_stMotor.f32UdRef;            break;
+    case 12: fOut = g_stMotor.f32UqRef;            break;
+    case 13: fOut = g_stLuenberger.f32ErrPll * 8.0f; break;
+    case 14: fOut = g_stLuenberger.f32BemfMag * 4.0f; break;
+    default: fOut = 0.0f; break;
+    }
+
+    fOut = fclamp(fOut, -1.0f, 1.0f);
+    uint32_t dacVal = (uint32_t)((fOut + 1.0f) * 2047.5f);
+    if (dacVal > 4095U) dacVal = 4095U;
+    DAC1->DHR12R1 = dacVal;
+}
+
+/*============================================================================*/
 /* 全局变量                                                                    */
 /*============================================================================*/
 
@@ -837,6 +869,8 @@ void FOC_ControlStep(void)
     TIM1->CCR1 = g_stMotor.u16Ta;
     TIM1->CCR2 = g_stMotor.u16Tb;
     TIM1->CCR3 = g_stMotor.u16Tc;
+
+    FOC_DAC_Output(0.0f);  /* 通道由 FOC_DAC_CHANNEL_ID 宏决定 */
 
     g_stCtrl.u32RunFrames++;
 }

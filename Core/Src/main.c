@@ -18,6 +18,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "FOC.h"
+#include "vf_ctrl.h"
 #include "key.h"
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -29,8 +30,21 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SPEED_RUN  1200    /* 目标转速 (RPM) */
-#define SPEED_STEP_RPM  50.0f
+
+/* USE_VF_CTRL 定义于 vf_ctrl.h（供 main.c 和 stm32g4xx_it.c 共享） */
+
+/*--- VF 模式参数（USE_VF_CTRL=1 时生效） ---*/
+#if USE_VF_CTRL
+#define SPEED_RUN          200.0f   /* 目标转速 (RPM) */
+#define SPEED_STEP_RPM     50.0f    /* 加减速步长 (RPM) */
+#define VF_TARGET_ACCEL    200.0f   /* VF 加速度 (RPM/s) */
+#endif
+
+/*--- IF/FOC 模式参数（USE_VF_CTRL=0 时生效） ---*/
+#if !USE_VF_CTRL
+#define SPEED_RUN          500      /* 目标转速 (RPM) */
+#define SPEED_STEP_RPM     50.0f
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -126,6 +140,76 @@ static void Motor_Stop(void)
     FOC_Init();
 }
 
+#if USE_VF_CTRL
+/**
+  * @brief  VF 模式启动电机
+  */
+static void VF_Motor_Start(void)
+{
+    if (s_u8MotorRunning) return;
+    s_u8MotorRunning = 1;
+
+    VF_Init();
+
+    /* 设置加速度 */
+    VF_SetAccel(VF_TARGET_ACCEL);
+
+    /* 上桥前先给三相 50% 占空比 */
+    TIM1->CCR1 = PWM_HALF_CYCLE_VF;
+    TIM1->CCR2 = PWM_HALF_CYCLE_VF;
+    TIM1->CCR3 = PWM_HALF_CYCLE_VF;
+    TIM1->CNT  = 0;
+    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+
+    /* 启动 TIM1 六路 PWM */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+
+    /* 启动 ADC 注入组 */
+    HAL_ADCEx_InjectedStart_IT(&hadc1);
+    HAL_ADCEx_InjectedStart_IT(&hadc2);
+
+    /* 使能 TIM1 更新中断 */
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+
+    /* 设定目标转速 → VF 状态机自动进入 ALIGN → RAMPING */
+    VF_SetTargetRpm((float)SPEED_RUN);
+}
+
+/**
+  * @brief  VF 模式停止电机
+  */
+static void VF_Motor_Stop(void)
+{
+    if (!s_u8MotorRunning) return;
+    s_u8MotorRunning = 0;
+
+    VF_Stop();
+
+    __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+
+    TIM1->CCR1 = PWM_HALF_CYCLE_VF;
+    TIM1->CCR2 = PWM_HALF_CYCLE_VF;
+    TIM1->CCR3 = PWM_HALF_CYCLE_VF;
+
+    HAL_ADCEx_InjectedStop_IT(&hadc1);
+    HAL_ADCEx_InjectedStop_IT(&hadc2);
+
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
+
+    VF_Init();
+}
+#endif /* USE_VF_CTRL */
+
 static uint16_t ADC_InjectedReadOnce(ADC_HandleTypeDef *hadc)
 {
     uint32_t saved_jsqr = hadc->Instance->JSQR;
@@ -163,6 +247,24 @@ static int32_t VOFA_FloatToMilli(float value)
     return (int32_t)(value * 1000.0f - 0.5f);
 }
 
+static int VOFA_AppendAmps(char *buf, int pos, int size, float value)
+{
+    int32_t scaled = (int32_t)(value * 1000.0f + 0.5f);
+    int32_t abs_scaled = scaled;
+    const char *sign = "";
+
+    if (scaled < 0)
+    {
+        sign = "-";
+        abs_scaled = -scaled;
+    }
+
+    return pos + snprintf(&buf[pos], (size_t)(size - pos), "%s%ld.%03ld",
+                          sign,
+                          (long)(abs_scaled / 1000),
+                          (long)(abs_scaled % 1000));
+}
+
 static int VOFA_AppendMilli(char *buf, int pos, int size, float value)
 {
     int32_t scaled = VOFA_FloatToMilli(value);
@@ -193,6 +295,77 @@ static float VOFA_WrapDeg180(float deg)
     return deg;
 }
 
+#if USE_VF_CTRL
+static void VOFA_SendTelemetry(void)
+{
+    char buf[256];
+    int pos = 0;
+    float theta_deg = VOFA_RadToDeg(g_stVFCtrl.f32Theta);
+
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "vf:");
+
+    /* 目标转速 (RPM) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32TargetRpm);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 当前斜坡转速 (RPM) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32CurrentRpm);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 电角度 (deg) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_deg);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* Vd 指令 (pu) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32VdRef);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* Vq 指令 (pu) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32VqRef);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* V/f 输出电压 (pu) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32VfOutputPu);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 电频率 (Hz) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32FreqHz);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 运行帧数 */
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32RunFrames);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 阶段码 */
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)g_stVFCtrl.eStage);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 相电流 (pu) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32Ia);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32Ib);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 电流矢量幅值 (pu) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32CurrentMag);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 软过渡进度 */
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32SoftStartCount);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* ADC 原始值 */
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)(ADC1->JDR1));
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)(ADC2->JDR1));
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "\n");
+
+    if ((pos > 0) && (pos < (int)sizeof(buf)))
+    {
+        HAL_UART_Transmit(&huart3, (uint8_t *)buf, (uint16_t)pos, 10U);
+    }
+}
+#else
 static void VOFA_SendTelemetry(void)
 {
     char buf[384];
@@ -206,13 +379,13 @@ static void VOFA_SendTelemetry(void)
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32RpmRamp);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32IdRef);
+    pos = VOFA_AppendAmps(buf, pos, sizeof(buf), g_stCtrl.f32IdRef * FOC_BASE_CURRENT_A);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32IqRef);
+    pos = VOFA_AppendAmps(buf, pos, sizeof(buf), g_stCtrl.f32IqRef * FOC_BASE_CURRENT_A);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Id);
+    pos = VOFA_AppendAmps(buf, pos, sizeof(buf), g_stMotor.f32Id * FOC_BASE_CURRENT_A);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Iq);
+    pos = VOFA_AppendAmps(buf, pos, sizeof(buf), g_stMotor.f32Iq * FOC_BASE_CURRENT_A);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32UdRef);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
@@ -235,6 +408,22 @@ static void VOFA_SendTelemetry(void)
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32SpdIntegral);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stCtrl.f32IqBase);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendAmps(buf, pos, sizeof(buf), g_stMotor.f32Ia * FOC_BASE_CURRENT_A);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendAmps(buf, pos, sizeof(buf), g_stMotor.f32Ib * FOC_BASE_CURRENT_A);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Ia);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stMotor.f32Ib);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), FOC_fIaOffsetAdc);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), FOC_fIbOffsetAdc);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)(ADC1->JDR1));
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)(ADC2->JDR1));
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",%u", (unsigned int)g_stCtrl.u16DiagStage);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "\n");
 
@@ -243,6 +432,7 @@ static void VOFA_SendTelemetry(void)
         HAL_UART_Transmit(&huart3, (uint8_t *)buf, (uint16_t)pos, 10U);
     }
 }
+#endif /* USE_VF_CTRL */
 
 /* USER CODE END 0 */
 
@@ -323,14 +513,37 @@ int main(void)
     {
         if (s_u8MotorRunning)
         {
+#if USE_VF_CTRL
+            VF_Motor_Stop();
+#else
             Motor_Stop();
+#endif
         }
         else
         {
+#if USE_VF_CTRL
+            VF_Motor_Start();
+#else
             Motor_Start();
+#endif
         }
     }
 
+#if USE_VF_CTRL
+    /*--- VF 模式：PC9 加速 +50rpm ---*/
+    if (KEY_GetEvent(KEY_ID_SPEED_UP) == KEY_EVENT_PRESS)
+    {
+        if (s_u8MotorRunning)
+        {
+            float fNewTarget = g_stVFCtrl.f32TargetRpm + SPEED_STEP_RPM;
+            if (fNewTarget > 3000.0f)
+            {
+                fNewTarget = 3000.0f;
+            }
+            VF_SetTargetRpm(fNewTarget);
+        }
+    }
+#else
     /*--- 闭环后单击 PC9：目标速度 +50rpm ---*/
     if (KEY_GetEvent(KEY_ID_SPEED_UP) == KEY_EVENT_PRESS)
     {
@@ -346,6 +559,7 @@ int main(void)
         }
 #endif
     }
+#endif
 
     /*--- LED1 (PB12) 以 1Hz 闪烁 ---*/
     {

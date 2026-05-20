@@ -25,6 +25,7 @@
 #include "stm32g4xx_ll_adc.h"
 #include "stm32g4xx_ll_tim.h"
 #include "FOC.h"
+#include "vf_ctrl.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -254,11 +255,19 @@ void ADC1_2_IRQHandler(void)
   
   /* run High-frequency task */
   /* HFTaskRun(); */
+
+#if USE_VF_CTRL
+  /* ========== V/F 开环控制 ========== */
+  VF_GetPhaseCurrent();
+  VF_ControlStep();
+#else
+  /* ========== IF 开环/FOC 控制 ========== */
   /* 读取相电流（同时禁止 CH4 触发防止重入） */
   FOC_GetPhaseCurrent();
 
   /* 运行 FOC 控制步进 */
   FOC_ControlStep();
+#endif
   /* USER CODE END ADC1_2_IRQn 1 */
 }
 

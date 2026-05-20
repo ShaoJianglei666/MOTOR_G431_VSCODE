@@ -47,11 +47,17 @@ extern "C" {
 #define FOC_CTRL_TS                 (1.0f / (float)FOC_CTRL_FREQ)
 
 /*--- 电压限幅 ---*/
-#define FOC_VOLTAGE_MAX_PU          0.60f
-#define FOC_VOLTAGE_MIN_PU          0.06f
+#define FOC_VOLTAGE_MAX_PU          0.25f
+#define FOC_VOLTAGE_MIN_PU          0.03f
 #define FOC_VOLTAGE_MARGIN_PU       0.04f
 #define FOC_PI_CORRECTION_MAX_PU    0.06f
 #define FOC_VOLTAGE_1PU_V           (MOTOR_BUS_VOLTAGE / FOC_SQRT3)
+
+/*--- DAC 调试输出通道选择 ---*/
+#define FOC_DAC_CHANNEL_ID          0
+/*  0: Ia,  1: Ib,  2: Id,  3: Iq,  4: Valpha,  5: Vbeta,
+ *  6: Ealpha,  7: Ebeta,  8: Theta,  9: ThetaObs,  10: SpeedObs,
+ *  11: UdRef,  12: UqRef,  13: PLL_err,  14: BemfMag */
 
 /*--- 电流采样 ---*/
 #define FOC_ADC_CURRENT_SCALE       2048.0f
@@ -59,21 +65,18 @@ extern "C" {
 #define FOC_CURRENT_POLARITY_B     (-1.0f)
 
 /*--- IF 开环参数 ---*/
-#define FOC_FORCE_OPEN_LOOP         0         /**< 1=只运行开环调试, 0=允许切换闭环 */
+#define FOC_FORCE_OPEN_LOOP         1         /**< 1=只运行开环调试, 0=允许切换闭环 */
 #define FOC_IF_ALIGN_ID             0.0f      /**< 参考启动阶段不做静止 Id 对齐 */
-#define FOC_Q12_TO_PU(x)            ((x) / 4096.0f)
-#define FOC_PU_TO_Q12(x)            ((x) * 4096.0f)
-#define FOC_IF_IQ_START_Q12         500.0f    /**< Iq 软启动起点 (Q12计数, 约0.24A@2A基值) */
-#define FOC_IF_STARTUP_IQ_Q12       300.0f    /**< IF 启动 Iq 参考 (Q12计数, 约0.15A@2A基值) */
-#define FOC_IF_IQ_START             FOC_Q12_TO_PU(FOC_IF_IQ_START_Q12)
-#define FOC_IF_STARTUP_IQ           FOC_Q12_TO_PU(FOC_IF_STARTUP_IQ_Q12)
+/*--- IF 开环 Iq 电流指令 (pu, 1.0pu = FOC_BASE_CURRENT_A) ---*/
+#define FOC_IF_IQ_START             0.03f    /**< Iq 软启动起点 (pu, ~0.3A@10A基值) */
+#define FOC_IF_STARTUP_IQ           0.12f    /**< IF 启动 Iq 稳态参考 (pu, ~1.2A@10A基值) */
 #define FOC_CLOSED_IQ_BASE_RATIO    (1.0f / 3.0f) /**< 闭环维持电流目标比例 */
 #define FOC_CLOSED_IQ_BASE_TARGET   (FOC_IF_STARTUP_IQ * FOC_CLOSED_IQ_BASE_RATIO)
-#define FOC_IF_IQ_RAMP_FRAMES       1000U     /**< Iq 软启动时间 (100ms@10kHz) */
-#define FOC_IF_SWITCH_RPM           1000.0f    /**< 本工程闭环切换转速 (RPM) */
+#define FOC_IF_IQ_RAMP_FRAMES       30000U    /**< Iq 软启动时间 (3s@10kHz) */
+#define FOC_IF_SWITCH_RPM           500.0f    /**< 本工程闭环切换转速 (RPM) */
 #define FOC_IF_SETTLE_FRAMES        20000U    /**< 切换转速恒速等待 (2s@10kHz) */
-#define FOC_IF_RAMP_STEP_RPM        50.0f     /**< 加速步长 (RPM) */
-#define FOC_IF_RAMP_INTERVAL        800U      /**< 加速间隔 (帧, 80ms@10kHz) */
+#define FOC_IF_RAMP_STEP_RPM        30.0f     /**< 加速步长 (RPM) */
+#define FOC_IF_RAMP_INTERVAL        1800U     /**< 加速间隔 (帧, 180ms@10kHz, ~167rpm/s) */
 #define FOC_IF_SPEED_TOL_PCT        10U       /**< 观测速度容差百分比 (±10%) */
 #define FOC_IF_STABLE_COUNT_THR     500U      /**< 速度稳定判定连续帧数 (50ms@10kHz) */
 #define FOC_TRANSITION_FRAMES       5000U     /**< 角度渐进切换帧数 (500ms@10kHz) */
@@ -90,7 +93,7 @@ extern "C" {
 
 /*--- 电压前馈参数（基于 Motor_Param.h） ---*/
 /** @brief 电流基值 (A) */
-#define FOC_BASE_CURRENT_A          2.0f
+#define FOC_BASE_CURRENT_A          10.0f
 /** @brief 电压基值 (V) = Vdc/√3 */
 #define FOC_BASE_VOLTAGE_V          (MOTOR_BUS_VOLTAGE / FOC_SQRT3)
 /** @brief 电气角速度基值 (rad/s) */
@@ -120,10 +123,10 @@ extern "C" {
 #define FOC_OBS_LOCK_SPEED_RPM      100.0f
 #define FOC_ELEC_OMEGA_TO_RPM       (60.0f / (FOC_2PI * (float)MOTOR_POLE_PAIRS))
 
-/*--- PI 电流环增益（小电流电机降低增益防振荡） ---*/
-#define FOC_PI_ID_KP                0.05f
+/*--- PI 电流环增益（35μH 低电感电机） ---*/
+#define FOC_PI_ID_KP                0.02f
 #define FOC_PI_ID_KI                0.001f
-#define FOC_PI_IQ_KP                0.05f
+#define FOC_PI_IQ_KP                0.02f
 #define FOC_PI_IQ_KI                0.001f
 /*--- PI 速度环增益（纯浮点 pu，不再使用 Q12 定点） ---*/
 /**
@@ -135,8 +138,7 @@ extern "C" {
 
 #define FOC_PI_SPEED_KP             0.44f   
 #define FOC_PI_SPEED_KI             0.00094f 
-#define FOC_CLOSED_IQ_REF_MAX_Q12   800.0f      /**< 闭环 IqRef 上限 (Q12计数, 仅常量定义用) */
-#define FOC_CLOSED_IQ_REF_MAX       FOC_Q12_TO_PU(FOC_CLOSED_IQ_REF_MAX_Q12) /**< 闭环 IqRef 上限 (pu) */
+#define FOC_CLOSED_IQ_REF_MAX       0.195f      /**< 闭环 IqRef 上限 (pu) */
 #define FOC_PI_SPEED_OUT_MAX        FOC_CLOSED_IQ_REF_MAX       /**< 速度PI输出上限 (pu) */
 #define FOC_PI_SPEED_OUT_MIN        (-FOC_CLOSED_IQ_REF_MAX)    /**< 速度PI输出下限 (pu) */
 #if FOC_PI_SPEED_ENHANCED
@@ -272,6 +274,7 @@ void  FOC_Clarke(float fIa, float fIb, float *pfIalpha, float *pfIbeta);
 void  FOC_Park(float fIalpha, float fIbeta, float fTheta, float *pfId, float *pfIq);
 void  FOC_InvPark(float fVd, float fVq, float fTheta, float *pfValpha, float *pfVbeta);
 float FOC_PI_Run(FOC_PI *pstPi, float fRef, float fFb);
+void  FOC_DAC_Output(float fValue);
 
 #ifdef __cplusplus
 }
