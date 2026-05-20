@@ -350,8 +350,16 @@ static void VOFA_SendTelemetry(void)
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32CurrentMag);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* 软过渡进度 */
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32SoftStartCount);
+    /* IF 目标电流 / PI 输出 */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32IfITarget);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32PiMagOut);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* blend / VF run 计数 */
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32IfBlendCount);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32VfRunCount);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
     /* ADC 原始值 */

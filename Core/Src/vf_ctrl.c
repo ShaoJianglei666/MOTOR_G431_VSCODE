@@ -67,6 +67,63 @@ static inline void vf_sincos(float theta, float *psin, float *pcos)
 }
 
 /*============================================================================*/
+/* Park 变换: Id=Ialpha*cos+Ibeta*sin, Iq=-Ialpha*sin+Ibeta*cos              */
+/*============================================================================*/
+static inline void vf_park(float fIalpha, float fIbeta, float fTheta,
+                           float *pfId, float *pfIq)
+{
+    float fSin, fCos;
+    vf_sincos(fTheta, &fSin, &fCos);
+    *pfId =  fIalpha * fCos + fIbeta * fSin;
+    *pfIq = -fIalpha * fSin + fIbeta * fCos;
+}
+
+/*============================================================================*/
+/* 矢量限幅: sqrt(x²+y²) > limit → 等比例缩小                                 */
+/*============================================================================*/
+static inline void vf_limit_vector(float *px, float *py, float limit)
+{
+    float mag_sq = (*px * *px) + (*py * *py);
+    float limit_sq = limit * limit;
+    if (mag_sq > limit_sq)
+    {
+        float scale = limit / sqrtf(mag_sq);
+        *px *= scale;
+        *py *= scale;
+    }
+}
+
+/*============================================================================*/
+/* 增量式 PI 控制器（带抗饱和）                                                */
+/*============================================================================*/
+static float vf_pi_run(VF_PI *pst, float fRef, float fFb)
+{
+    float fErr = fRef - fFb;
+    float fDelta = pst->fKp * (fErr - pst->fErrPrev);
+    float fKiTerm;
+
+    pst->fErrPrev = fErr;
+    pst->fProportional = pst->fKp * fErr;
+
+    fKiTerm = pst->fKi * fErr;
+
+    if (!((pst->fOutPrev >= pst->fOutMax && fKiTerm > 0.0f) ||
+          (pst->fOutPrev <= pst->fOutMin && fKiTerm < 0.0f)))
+    {
+        fDelta += fKiTerm;
+        pst->fIntegral += fKiTerm;
+        pst->fIntegral = vf_clamp(pst->fIntegral,
+                                  pst->fOutMin * 0.5f,
+                                  pst->fOutMax * 0.5f);
+    }
+
+    float fOut = pst->fOutPrev + fDelta;
+    fOut = vf_clamp(fOut, pst->fOutMin, pst->fOutMax);
+    pst->fOutPrev = fOut;
+    return fOut;
+}
+
+/*============================================================================*/
 /* SVPWM — 共模注入法，零序分量注入                                            */
 /*============================================================================*/
 void VF_Svpwm(float fValpha, float fVbeta,
@@ -214,6 +271,9 @@ void VF_Init(void)
     g_stVFCtrl.f32VqRef           = 0.0f;
     g_stVFCtrl.f32AlignVdRef      = 0.0f;
     g_stVFCtrl.u32SoftStartCount  = 0;
+    g_stVFCtrl.u32VfRunCount      = 0;
+    g_stVFCtrl.u32IfBlendCount    = 0;
+    g_stVFCtrl.f32IfITarget       = 0.0f;
 }
 
 /*============================================================================*/
@@ -231,6 +291,7 @@ void VF_SetTargetRpm(float fTargetRpm)
         g_stVFCtrl.f32Theta      = 0.0f;
         g_stVFCtrl.u32AlignCount = 0;
         g_stVFCtrl.u32SoftStartCount = 0;
+        g_stVFCtrl.u32VfRunCount = 0;
         g_stVFCtrl.u32RunFrames  = 0;
     }
 }
@@ -368,7 +429,7 @@ void VF_ControlStep(void)
     }
 
     /*----------------------------------------------------------------------*/
-    /* RUNNING: 到达目标转速，恒速运行                                         */
+    /* RUNNING: VF 恒速运行，计数 2s 后自动切到 IF                           */
     /*----------------------------------------------------------------------*/
     case VF_STAGE_RUNNING:
     {
@@ -379,9 +440,111 @@ void VF_ControlStep(void)
         fStepAngle = fOmegaElec * VF_CTRL_TS;
         g_stVFCtrl.f32Theta = vf_wrap_2pi(g_stVFCtrl.f32Theta + fStepAngle);
 
+        /* V/f 曲线电压 */
         fVqPu = VF_GetVoltagePu(g_stVFCtrl.f32CurrentRpm);
         g_stVFCtrl.f32VdRef = 0.0f;
         g_stVFCtrl.f32VqRef = fVqPu;
+
+        /* VF 运行 2s 后 → IF_BLEND */
+        g_stVFCtrl.u32VfRunCount++;
+        if (g_stVFCtrl.u32VfRunCount >= VF_IF_SWITCH_DELAY)
+        {
+            /* ★ 预载单 PI：用实测 αβ 电流幅值做目标
+             *    VF 正在转，当前电流就是电机此刻需要的电流。
+             *    目标 = 实测值 → PI 不需要改变电流，只需维持。
+             *    fOutPrev = V/f 电压（已产出此电流）→ 输出连续。
+             */
+            g_stVFCtrl.stPiMag.fKp      = VF_IF_PI_KP;
+            g_stVFCtrl.stPiMag.fKi      = VF_IF_PI_KI;
+            g_stVFCtrl.stPiMag.fErrPrev = 0.0f;
+            g_stVFCtrl.stPiMag.fOutPrev = fVqPu;
+            g_stVFCtrl.stPiMag.fIntegral= fVqPu;
+            g_stVFCtrl.stPiMag.fOutMax  = VF_IF_PI_OUT_MAX;
+            g_stVFCtrl.stPiMag.fOutMin  = VF_IF_PI_OUT_MIN;
+
+            /* ★ 关键：用切换瞬间的实测电流做目标 */
+            g_stVFCtrl.f32IfITarget     = g_stVFCtrl.f32CurrentMag;
+            g_stVFCtrl.f32IfBlendVqStart = fVqPu;
+            g_stVFCtrl.u32IfBlendCount   = 0;
+            g_stVFCtrl.eStage = VF_STAGE_IF_BLEND;
+        }
+        break;
+    }
+
+    /*----------------------------------------------------------------------*/
+    /* IF_BLEND: 诊断阶段 — 保持 V/f 电压不变，检查切换本身是否导致电流掉    */
+    /*           如果这里电流不掉，说明是 PI 的问题；如果还掉，是切换问题   */
+    /*----------------------------------------------------------------------*/
+    case VF_STAGE_IF_BLEND:
+    {
+        g_stVFCtrl.f32CurrentRpm = g_stVFCtrl.f32TargetRpm;
+
+        fOmegaElec = g_stVFCtrl.f32CurrentRpm
+                   * VF_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
+        fStepAngle = fOmegaElec * VF_CTRL_TS;
+        g_stVFCtrl.f32Theta = vf_wrap_2pi(g_stVFCtrl.f32Theta + fStepAngle);
+
+        /* ★ 过流保护（暂时屏蔽以诊断切换问题） */
+        {
+            float fMagSq = g_stVFCtrl.f32Ialpha * g_stVFCtrl.f32Ialpha
+                         + g_stVFCtrl.f32Ibeta * g_stVFCtrl.f32Ibeta;
+            g_stVFCtrl.f32CurrentMag = sqrtf(fMagSq);
+            /* if (fMagSq > (VF_IF_OC_LIMIT_PU * VF_IF_OC_LIMIT_PU))
+            {
+                g_stVFCtrl.eStage = VF_STAGE_FAULT;
+                ...
+            } */
+        }
+
+        /* 保持 V/f 电压不变（同 VF_RUNNING），诊断切换本身 */
+        fVqPu = VF_GetVoltagePu(g_stVFCtrl.f32CurrentRpm);
+        g_stVFCtrl.f32VdRef = 0.0f;
+        g_stVFCtrl.f32VqRef = fVqPu;
+
+        g_stVFCtrl.u32IfBlendCount++;
+        if (g_stVFCtrl.u32IfBlendCount >= VF_IF_BLEND_FRAMES)
+        {
+            /* blend 结束后启用 PI */
+            g_stVFCtrl.stPiMag.fKp      = VF_IF_PI_KP;
+            g_stVFCtrl.stPiMag.fKi      = VF_IF_PI_KI;
+            g_stVFCtrl.stPiMag.fErrPrev = 0.0f;
+            g_stVFCtrl.stPiMag.fOutPrev = fVqPu;
+            g_stVFCtrl.stPiMag.fIntegral= fVqPu;
+            g_stVFCtrl.stPiMag.fOutMax  = VF_IF_PI_OUT_MAX;
+            g_stVFCtrl.stPiMag.fOutMin  = VF_IF_PI_OUT_MIN;
+            g_stVFCtrl.f32IfITarget     = g_stVFCtrl.f32CurrentMag;
+            g_stVFCtrl.eStage = VF_STAGE_IF_RUNNING;
+        }
+        break;
+    }
+
+    /*----------------------------------------------------------------------*/
+    /* IF_RUNNING: PI 控 αβ 电流幅值闭环                                    */
+    /*----------------------------------------------------------------------*/
+    case VF_STAGE_IF_RUNNING:
+    {
+        g_stVFCtrl.f32CurrentRpm = g_stVFCtrl.f32TargetRpm;
+
+        fOmegaElec = g_stVFCtrl.f32CurrentRpm
+                   * VF_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
+        fStepAngle = fOmegaElec * VF_CTRL_TS;
+        g_stVFCtrl.f32Theta = vf_wrap_2pi(g_stVFCtrl.f32Theta + fStepAngle);
+
+        /* 过流保护（暂屏蔽） */
+        {
+            float fMagSq = g_stVFCtrl.f32Ialpha * g_stVFCtrl.f32Ialpha
+                         + g_stVFCtrl.f32Ibeta * g_stVFCtrl.f32Ibeta;
+            g_stVFCtrl.f32CurrentMag = sqrtf(fMagSq);
+        }
+
+        /* PI 控 αβ 电流幅值 */
+        g_stVFCtrl.f32PiMagOut = vf_pi_run(
+            &g_stVFCtrl.stPiMag,
+            g_stVFCtrl.f32IfITarget,
+            g_stVFCtrl.f32CurrentMag);
+
+        g_stVFCtrl.f32VdRef = 0.0f;
+        g_stVFCtrl.f32VqRef = g_stVFCtrl.f32PiMagOut;
         break;
     }
 

@@ -117,6 +117,26 @@ extern "C" {
   */
 #define VF_CURRENT_LIMIT_PU             0.50f   /* 5A@10A基值 */
 
+/** @brief VF→IF 切换延时 (帧) — VF_RUNNING 后等待 2s 再切 */
+#define VF_IF_SWITCH_DELAY              20000U  /* 2s @ 10kHz */
+
+/** @brief VF→IF blend 过渡帧数 */
+#define VF_IF_BLEND_FRAMES              20000U  /* 2s @ 10kHz */
+
+/** @brief IF 电流目标 (pu) — αβ 电流幅值 */
+#define VF_IF_I_TARGET_PU               0.15f   /* 1.5A */
+
+/** @brief IF PI 增益（单 PI 控 αβ 幅值） */
+#define VF_IF_PI_KP                     0.02f
+#define VF_IF_PI_KI                     0.0002f
+
+/** @brief IF PI 输出限幅 (pu) */
+#define VF_IF_PI_OUT_MAX                0.85f
+#define VF_IF_PI_OUT_MIN                (-VF_IF_PI_OUT_MAX)
+
+/** @brief IF 过流保护阈值 (pu) — 暂提高避免切换毛刺误触发 */
+#define VF_IF_OC_LIMIT_PU               1.5f    /* 15A */
+
 /** @brief 对齐占空比 (50%=中点) */
 #define PWM_HALF_CYCLE_VF               (17000U / 4U)
 
@@ -130,9 +150,26 @@ typedef enum
     VF_STAGE_STOP      = 0,  /**< 停止 */
     VF_STAGE_ALIGN     = 1,  /**< 转子预对齐 */
     VF_STAGE_RAMPING   = 2,  /**< 频率斜坡加速 */
-    VF_STAGE_RUNNING   = 3,  /**< 到达目标转速稳定运行 */
-    VF_STAGE_FAULT     = 4   /**< 故障 */
+    VF_STAGE_RUNNING   = 3,  /**< VF 恒速运行 */
+    VF_STAGE_IF_BLEND  = 4,  /**< VF→IF 过渡 blend */
+    VF_STAGE_IF_RUNNING= 5,  /**< IF 电流环闭环运行 */
+    VF_STAGE_FAULT     = 6   /**< 故障 */
 } VF_Stage;
+
+/**
+  * @brief PI 控制器（增量式）
+  */
+typedef struct
+{
+    float fKp;
+    float fKi;
+    float fErrPrev;
+    float fOutPrev;
+    float fIntegral;
+    float fProportional;
+    float fOutMax;
+    float fOutMin;
+} VF_PI;
 
 /**
   * @brief VF 控制状态结构体
@@ -160,6 +197,16 @@ typedef struct
     /*--- 软启动状态 ---*/
     uint32_t  u32SoftStartCount;/**< 软过渡计数器 */
     float     f32AlignVdRef;    /**< 对齐时的 Vd 值，软过渡用 */
+
+    /*--- VF→IF 切换状态 ---*/
+    uint32_t  u32VfRunCount;    /**< VF_RUNNING 运行帧数 */
+    uint32_t  u32IfBlendCount;  /**< IF blend 计数器 */
+    float     f32IfBlendVqStart;/**< blend 起始 Vq (V/f 值) */
+
+    /*--- IF 电流环状态（单 PI 控 αβ 电流幅值，不依赖 Park）---*/
+    float     f32IfITarget;     /**< αβ 电流幅值目标 (pu) */
+    VF_PI     stPiMag;          /**< αβ 电流幅值 PI */
+    float     f32PiMagOut;      /**< PI 输出 (pu) */
 
     /*--- 电流监控 ---*/
     float     f32Ia;            /**< A 相电流 (pu) */
