@@ -50,6 +50,13 @@ static inline float vf_wrap_2pi(float theta)
     return theta;
 }
 
+static inline float vf_wrap_pi(float theta)
+{
+    while (theta >= VF_MATH_PI) theta -= VF_2PI;
+    while (theta < -VF_MATH_PI) theta += VF_2PI;
+    return theta;
+}
+
 /**
   * @brief 正弦查找表 (256 点，与 FOC 共享)
   *        直接引用 FOC 模块的正弦表
@@ -256,6 +263,105 @@ void VF_GetPhaseCurrent(void)
 }
 
 /*============================================================================*/
+/* 龙伯格反电势观测器 — 仅观测诊断，不参与控制                                */
+/*============================================================================*/
+
+void VF_LuenbergerInit(void)
+{
+    memset(&g_stVFCtrl.stObs, 0, sizeof(g_stVFCtrl.stObs));
+    g_stVFCtrl.stObs.f32ThetaObs = g_stVFCtrl.f32Theta;
+}
+
+void VF_LuenbergerRun(void)
+{
+    VF_Luenberger *pst = &g_stVFCtrl.stObs;
+    float fIalphaPred, fIbetaPred;
+    float fErrAlpha, fErrBeta;
+    float fEalphaRaw, fEbetaRaw;
+    float fBemfSq, fBemfMag;
+    float fSin, fCos;
+    float fErrPll;
+    float fOmegaOpen;
+    float fSpeedBlend;
+
+    if (g_stVFCtrl.eStage == VF_STAGE_STOP)
+    {
+        VF_LuenbergerInit();
+        return;
+    }
+
+    /* 电流预测: Î(k+1) = Î(k) + (V - Rs·Î - Ê) · Ts / Ls */
+    fIalphaPred = pst->f32IalphaHat
+                + (g_stVFCtrl.f32Valpha
+                   - VF_OBS_RS_PU * pst->f32IalphaHat
+                   - pst->f32Ealpha) / VF_OBS_LS_OVER_TS_PU;
+    fIbetaPred = pst->f32IbetaHat
+               + (g_stVFCtrl.f32Vbeta
+                  - VF_OBS_RS_PU * pst->f32IbetaHat
+                  - pst->f32Ebeta) / VF_OBS_LS_OVER_TS_PU;
+
+    /* 电流估计误差 */
+    fErrAlpha = g_stVFCtrl.f32Ialpha - fIalphaPred;
+    fErrBeta  = g_stVFCtrl.f32Ibeta  - fIbetaPred;
+
+    /* 修正电流估计 */
+    pst->f32IalphaHat = fIalphaPred + VF_OBS_CURRENT_GAIN * fErrAlpha;
+    pst->f32IbetaHat  = fIbetaPred  + VF_OBS_CURRENT_GAIN * fErrBeta;
+
+    /* 反电势更新（带 LPF） */
+    fEalphaRaw = pst->f32Ealpha - VF_OBS_BEMF_GAIN * fErrAlpha;
+    fEbetaRaw  = pst->f32Ebeta  - VF_OBS_BEMF_GAIN * fErrBeta;
+
+    pst->f32Ealpha += VF_OBS_BEMF_LPF_GAIN * (fEalphaRaw - pst->f32Ealpha);
+    pst->f32Ebeta  += VF_OBS_BEMF_LPF_GAIN * (fEbetaRaw  - pst->f32Ebeta);
+
+    pst->f32Ealpha = vf_clamp(pst->f32Ealpha, -VF_MAX_VOLTAGE_PU, VF_MAX_VOLTAGE_PU);
+    pst->f32Ebeta  = vf_clamp(pst->f32Ebeta,  -VF_MAX_VOLTAGE_PU, VF_MAX_VOLTAGE_PU);
+
+    /* BEMF 幅值 */
+    fBemfSq = pst->f32Ealpha * pst->f32Ealpha
+            + pst->f32Ebeta  * pst->f32Ebeta;
+    fBemfMag = sqrtf(fBemfSq);
+    pst->f32BemfMag = fBemfMag;
+
+    /* PLL 误差 */
+    vf_sincos(pst->f32ThetaObs, &fSin, &fCos);
+    fErrPll = (-pst->f32Ealpha * fCos - pst->f32Ebeta * fSin);
+    if (fBemfMag > VF_OBS_MIN_BEMF_PU)
+    {
+        fErrPll /= fBemfMag;
+    }
+    fErrPll = vf_clamp(fErrPll, -VF_OBS_PLL_ERR_MAX, VF_OBS_PLL_ERR_MAX);
+    pst->f32ErrPll = fErrPll;
+
+    /* 开环角速度（用于速度辅助收敛） */
+    fOmegaOpen = g_stVFCtrl.f32CurrentRpm
+               * VF_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
+    fOmegaOpen = vf_clamp(fOmegaOpen, 0.0f, VF_OBS_MAX_OMEGA_ELEC);
+
+    /* PLL 速度更新（低转速时 blend 开环速度辅助收敛） */
+    fSpeedBlend = (pst->u16Locked != 0U) ? 0.0f : VF_OBS_PLL_SPEED_BLEND;
+    pst->f32OmegaElec = (1.0f - fSpeedBlend) * pst->f32OmegaElec
+                      + fSpeedBlend * fOmegaOpen
+                      + VF_OBS_PLL_KI * VF_CTRL_TS * fErrPll;
+    pst->f32OmegaElec = vf_clamp(pst->f32OmegaElec, 0.0f, VF_OBS_MAX_OMEGA_ELEC);
+
+    /* PLL 角度更新 */
+    pst->f32ThetaObs = vf_wrap_2pi(pst->f32ThetaObs
+                         + pst->f32OmegaElec * VF_CTRL_TS
+                         + VF_OBS_PLL_KP * VF_CTRL_TS * fErrPll);
+
+    /* 观测速度 */
+    pst->f32SpeedObs = pst->f32OmegaElec * VF_OBS_ELEC_OMEGA_TO_RPM;
+    pst->f32ErrAlpha = fErrAlpha;
+    pst->f32ErrBeta  = fErrBeta;
+
+    /* 锁定判断 */
+    pst->u16Locked = ((fBemfSq > VF_OBS_LOCK_BEMF_SQ_THR) &&
+                      (pst->f32SpeedObs > VF_OBS_LOCK_SPEED_RPM)) ? 1U : 0U;
+}
+
+/*============================================================================*/
 /* VF 控制初始化                                                              */
 /*============================================================================*/
 void VF_Init(void)
@@ -273,7 +379,15 @@ void VF_Init(void)
     g_stVFCtrl.u32SoftStartCount  = 0;
     g_stVFCtrl.u32VfRunCount      = 0;
     g_stVFCtrl.u32IfBlendCount    = 0;
+    g_stVFCtrl.u32IfRunCount      = 0;
+    g_stVFCtrl.u32ObsBlendCount   = 0;
     g_stVFCtrl.f32IfITarget       = 0.0f;
+    g_stVFCtrl.f32IdTarget        = 0.0f;
+    g_stVFCtrl.f32IqTarget        = 0.0f;
+    g_stVFCtrl.f32VdPiOut         = 0.0f;
+    g_stVFCtrl.f32VqPiOut         = 0.0f;
+    g_stVFCtrl.f32ThetaOpen       = 0.0f;
+    VF_LuenbergerInit();
 }
 
 /*============================================================================*/
@@ -449,21 +563,37 @@ void VF_ControlStep(void)
         g_stVFCtrl.u32VfRunCount++;
         if (g_stVFCtrl.u32VfRunCount >= VF_IF_SWITCH_DELAY)
         {
-            /* ★ 预载单 PI：用实测 αβ 电流幅值做目标
-             *    VF 正在转，当前电流就是电机此刻需要的电流。
-             *    目标 = 实测值 → PI 不需要改变电流，只需维持。
-             *    fOutPrev = V/f 电压（已产出此电流）→ 输出连续。
+            /* ★ 预载 dq PI：
+             *    VF 模式下 Vd=0, Vq=fVqPu。
+             *    PI_d 输出从 0 开始，PI_q 输出从 fVqPu 开始。
+             *    目标电流用切换瞬间的实测 dq 电流，保证输出连续。
              */
-            g_stVFCtrl.stPiMag.fKp      = VF_IF_PI_KP;
-            g_stVFCtrl.stPiMag.fKi      = VF_IF_PI_KI;
-            g_stVFCtrl.stPiMag.fErrPrev = 0.0f;
-            g_stVFCtrl.stPiMag.fOutPrev = fVqPu;
-            g_stVFCtrl.stPiMag.fIntegral= fVqPu;
-            g_stVFCtrl.stPiMag.fOutMax  = VF_IF_PI_OUT_MAX;
-            g_stVFCtrl.stPiMag.fOutMin  = VF_IF_PI_OUT_MIN;
+            vf_park(g_stVFCtrl.f32Ialpha, g_stVFCtrl.f32Ibeta,
+                    g_stVFCtrl.f32Theta,
+                    &g_stVFCtrl.f32Id, &g_stVFCtrl.f32Iq);
 
-            /* ★ 关键：用切换瞬间的实测电流做目标 */
-            g_stVFCtrl.f32IfITarget     = g_stVFCtrl.f32CurrentMag;
+            g_stVFCtrl.f32IdTarget = 0.0f;
+            g_stVFCtrl.f32IqTarget = g_stVFCtrl.f32Iq;
+            g_stVFCtrl.f32IfITarget = g_stVFCtrl.f32Iq;
+
+            /* d 轴 PI：Vd=0 开始，限幅小范围 */
+            g_stVFCtrl.stPiD.fKp       = VF_IF_PI_KP;
+            g_stVFCtrl.stPiD.fKi       = VF_IF_PI_KI;
+            g_stVFCtrl.stPiD.fErrPrev  = 0.0f;
+            g_stVFCtrl.stPiD.fOutPrev  = 0.0f;
+            g_stVFCtrl.stPiD.fIntegral = 0.0f;
+            g_stVFCtrl.stPiD.fOutMax   = VF_IF_PI_CORRECTION_MAX;
+            g_stVFCtrl.stPiD.fOutMin   = -VF_IF_PI_CORRECTION_MAX;
+
+            /* q 轴 PI：Vq=fVqPu 开始（维持当前转矩），限幅大范围 */
+            g_stVFCtrl.stPiQ.fKp       = VF_IF_PI_KP;
+            g_stVFCtrl.stPiQ.fKi       = VF_IF_PI_KI;
+            g_stVFCtrl.stPiQ.fErrPrev  = 0.0f;
+            g_stVFCtrl.stPiQ.fOutPrev  = fVqPu * 1.10f;
+            g_stVFCtrl.stPiQ.fIntegral = fVqPu * 1.10f;
+            g_stVFCtrl.stPiQ.fOutMax   = VF_IF_PI_OUT_MAX;
+            g_stVFCtrl.stPiQ.fOutMin   = VF_IF_PI_OUT_MIN;
+
             g_stVFCtrl.f32IfBlendVqStart = fVqPu;
             g_stVFCtrl.u32IfBlendCount   = 0;
             g_stVFCtrl.eStage = VF_STAGE_IF_BLEND;
@@ -504,25 +634,42 @@ void VF_ControlStep(void)
         g_stVFCtrl.u32IfBlendCount++;
         if (g_stVFCtrl.u32IfBlendCount >= VF_IF_BLEND_FRAMES)
         {
-            /* blend 结束后启用 PI */
-            g_stVFCtrl.stPiMag.fKp      = VF_IF_PI_KP;
-            g_stVFCtrl.stPiMag.fKi      = VF_IF_PI_KI;
-            g_stVFCtrl.stPiMag.fErrPrev = 0.0f;
-            g_stVFCtrl.stPiMag.fOutPrev = fVqPu;
-            g_stVFCtrl.stPiMag.fIntegral= fVqPu;
-            g_stVFCtrl.stPiMag.fOutMax  = VF_IF_PI_OUT_MAX;
-            g_stVFCtrl.stPiMag.fOutMin  = VF_IF_PI_OUT_MIN;
-            g_stVFCtrl.f32IfITarget     = g_stVFCtrl.f32CurrentMag;
+            /* blend 结束后启用 dq PI */
+            /* 注意：不做 Park 重新测量 Iq_target，保持 3→4 过渡时设定的值不变 */
+            vf_park(g_stVFCtrl.f32Ialpha, g_stVFCtrl.f32Ibeta,
+                    g_stVFCtrl.f32Theta,
+                    &g_stVFCtrl.f32Id, &g_stVFCtrl.f32Iq);
+
+            /* 不修改 f32IqTarget / f32IfITarget — 保持 RUNNING→IF_BLEND 时的设定值 */
+
+            g_stVFCtrl.stPiD.fKp       = VF_IF_PI_KP;
+            g_stVFCtrl.stPiD.fKi       = VF_IF_PI_KI;
+            g_stVFCtrl.stPiD.fErrPrev  = 0.0f;
+            g_stVFCtrl.stPiD.fOutPrev  = 0.0f;
+            g_stVFCtrl.stPiD.fIntegral = 0.0f;
+            g_stVFCtrl.stPiD.fOutMax   = VF_IF_PI_CORRECTION_MAX;
+            g_stVFCtrl.stPiD.fOutMin   = -VF_IF_PI_CORRECTION_MAX;
+
+            g_stVFCtrl.stPiQ.fKp       = VF_IF_PI_KP;
+            g_stVFCtrl.stPiQ.fKi       = VF_IF_PI_KI;
+            g_stVFCtrl.stPiQ.fErrPrev  = 0.0f;
+            g_stVFCtrl.stPiQ.fOutPrev  = fVqPu;
+            g_stVFCtrl.stPiQ.fIntegral = fVqPu;
+            g_stVFCtrl.stPiQ.fOutMax   = VF_IF_PI_OUT_MAX;
+            g_stVFCtrl.stPiQ.fOutMin   = VF_IF_PI_OUT_MIN;
             g_stVFCtrl.eStage = VF_STAGE_IF_RUNNING;
         }
         break;
     }
 
     /*----------------------------------------------------------------------*/
-    /* IF_RUNNING: PI 控 αβ 电流幅值闭环                                    */
+    /* IF_RUNNING: 开环角度 + dq 电流环 PI                                  */
+    /*             保持 2s 后自动加速到 VF_IF_TARGET_RPM                     */
+    /*             角度仍为开环积分，观测器仅旁路诊断。                      */
     /*----------------------------------------------------------------------*/
     case VF_STAGE_IF_RUNNING:
     {
+        g_stVFCtrl.u32IfRunCount++;
         g_stVFCtrl.f32CurrentRpm = g_stVFCtrl.f32TargetRpm;
 
         fOmegaElec = g_stVFCtrl.f32CurrentRpm
@@ -537,14 +684,142 @@ void VF_ControlStep(void)
             g_stVFCtrl.f32CurrentMag = sqrtf(fMagSq);
         }
 
-        /* PI 控 αβ 电流幅值 */
-        g_stVFCtrl.f32PiMagOut = vf_pi_run(
-            &g_stVFCtrl.stPiMag,
-            g_stVFCtrl.f32IfITarget,
-            g_stVFCtrl.f32CurrentMag);
+        /* Park 变换得到 dq 电流反馈 */
+        vf_park(g_stVFCtrl.f32Ialpha, g_stVFCtrl.f32Ibeta,
+                g_stVFCtrl.f32Theta,
+                &g_stVFCtrl.f32Id, &g_stVFCtrl.f32Iq);
 
-        g_stVFCtrl.f32VdRef = 0.0f;
-        g_stVFCtrl.f32VqRef = g_stVFCtrl.f32PiMagOut;
+        /* d 轴 PI：Id_ref = 0 */
+        g_stVFCtrl.f32VdPiOut = vf_pi_run(
+            &g_stVFCtrl.stPiD,
+            g_stVFCtrl.f32IdTarget,
+            g_stVFCtrl.f32Id);
+
+        /* q 轴 PI */
+        g_stVFCtrl.f32VqPiOut = vf_pi_run(
+            &g_stVFCtrl.stPiQ,
+            g_stVFCtrl.f32IqTarget,
+            g_stVFCtrl.f32Iq);
+
+        g_stVFCtrl.f32VdRef = g_stVFCtrl.f32VdPiOut;
+        g_stVFCtrl.f32VqRef = g_stVFCtrl.f32VqPiOut;
+
+        /*--- 开环角度备份 ---*/
+        g_stVFCtrl.f32ThetaOpen = vf_wrap_2pi(g_stVFCtrl.f32ThetaOpen + fStepAngle);
+
+        /*--- 保持5s后切观测角 ---*/
+        if ((g_stVFCtrl.u32IfRunCount >= VF_OBS_SWITCH_DELAY) &&
+            (g_stVFCtrl.stObs.u16Locked != 0U))
+        {
+            g_stVFCtrl.f32ThetaErrSave =
+                vf_wrap_pi(g_stVFCtrl.stObs.f32ThetaObs - g_stVFCtrl.f32Theta);
+            g_stVFCtrl.f32ThetaOpenRef = g_stVFCtrl.f32Theta;
+            g_stVFCtrl.u32ObsBlendCount = 0;
+            g_stVFCtrl.eStage = VF_STAGE_OBS_TRANSITION;
+        }
+        break;
+    }
+
+    /*----------------------------------------------------------------------*/
+    /* OBS_TRANSITION: 控制角从 IF 开环角度渐进逼近观测角                    */
+    /*----------------------------------------------------------------------*/
+    case VF_STAGE_OBS_TRANSITION:
+    {
+        float fCnt;
+        float fRemain;
+
+        g_stVFCtrl.f32CurrentRpm = g_stVFCtrl.f32TargetRpm;
+
+        fOmegaElec = g_stVFCtrl.f32CurrentRpm
+                   * VF_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
+        fStepAngle = fOmegaElec * VF_CTRL_TS;
+        /* 开环角度继续积分（备份，用于诊断） */
+        g_stVFCtrl.f32ThetaOpen = vf_wrap_2pi(g_stVFCtrl.f32ThetaOpen + fStepAngle);
+
+        g_stVFCtrl.u32ObsBlendCount++;
+        fCnt = (float)g_stVFCtrl.u32ObsBlendCount;
+        if (fCnt > (float)VF_OBS_TRANSITION_FRAMES)
+        {
+            fCnt = (float)VF_OBS_TRANSITION_FRAMES;
+        }
+
+        /* 渐进逼近: θ = θ_obs - 残余误差 × (剩余帧数/总帧数) */
+        fRemain = g_stVFCtrl.f32ThetaErrSave
+                * ((float)VF_OBS_TRANSITION_FRAMES - fCnt)
+                / (float)VF_OBS_TRANSITION_FRAMES;
+        g_stVFCtrl.f32Theta = vf_wrap_2pi(g_stVFCtrl.stObs.f32ThetaObs - fRemain);
+
+        /* 过流保护（暂屏蔽） */
+        {
+            float fMagSq = g_stVFCtrl.f32Ialpha * g_stVFCtrl.f32Ialpha
+                         + g_stVFCtrl.f32Ibeta * g_stVFCtrl.f32Ibeta;
+            g_stVFCtrl.f32CurrentMag = sqrtf(fMagSq);
+        }
+
+        /* Park 变换得到 dq 电流反馈 */
+        vf_park(g_stVFCtrl.f32Ialpha, g_stVFCtrl.f32Ibeta,
+                g_stVFCtrl.f32Theta,
+                &g_stVFCtrl.f32Id, &g_stVFCtrl.f32Iq);
+
+        /* d 轴 PI */
+        g_stVFCtrl.f32VdPiOut = vf_pi_run(
+            &g_stVFCtrl.stPiD,
+            g_stVFCtrl.f32IdTarget,
+            g_stVFCtrl.f32Id);
+
+        /* q 轴 PI */
+        g_stVFCtrl.f32VqPiOut = vf_pi_run(
+            &g_stVFCtrl.stPiQ,
+            g_stVFCtrl.f32IqTarget,
+            g_stVFCtrl.f32Iq);
+
+        g_stVFCtrl.f32VdRef = g_stVFCtrl.f32VdPiOut;
+        g_stVFCtrl.f32VqRef = g_stVFCtrl.f32VqPiOut;
+
+        if (g_stVFCtrl.u32ObsBlendCount >= VF_OBS_TRANSITION_FRAMES)
+        {
+            /* 过渡完成，完全使用观测器角度 */
+            g_stVFCtrl.f32Theta = g_stVFCtrl.stObs.f32ThetaObs;
+            g_stVFCtrl.eStage = VF_STAGE_OBS_RUNNING;
+        }
+        break;
+    }
+
+    /*----------------------------------------------------------------------*/
+    /* OBS_RUNNING: 使用观测器电角度运行 dq 电流环                           */
+    /*----------------------------------------------------------------------*/
+    case VF_STAGE_OBS_RUNNING:
+    {
+        g_stVFCtrl.f32CurrentRpm = g_stVFCtrl.f32TargetRpm;
+
+        fOmegaElec = g_stVFCtrl.f32CurrentRpm
+                   * VF_2PI * (float)MOTOR_POLE_PAIRS / 60.0f;
+        fStepAngle = fOmegaElec * VF_CTRL_TS;
+        g_stVFCtrl.f32ThetaOpen = vf_wrap_2pi(g_stVFCtrl.f32ThetaOpen + fStepAngle);
+        g_stVFCtrl.f32Theta = g_stVFCtrl.stObs.f32ThetaObs;
+
+        {
+            float fMagSq = g_stVFCtrl.f32Ialpha * g_stVFCtrl.f32Ialpha
+                         + g_stVFCtrl.f32Ibeta * g_stVFCtrl.f32Ibeta;
+            g_stVFCtrl.f32CurrentMag = sqrtf(fMagSq);
+        }
+
+        vf_park(g_stVFCtrl.f32Ialpha, g_stVFCtrl.f32Ibeta,
+                g_stVFCtrl.f32Theta,
+                &g_stVFCtrl.f32Id, &g_stVFCtrl.f32Iq);
+
+        g_stVFCtrl.f32VdPiOut = vf_pi_run(
+            &g_stVFCtrl.stPiD,
+            g_stVFCtrl.f32IdTarget,
+            g_stVFCtrl.f32Id);
+
+        g_stVFCtrl.f32VqPiOut = vf_pi_run(
+            &g_stVFCtrl.stPiQ,
+            g_stVFCtrl.f32IqTarget,
+            g_stVFCtrl.f32Iq);
+
+        g_stVFCtrl.f32VdRef = g_stVFCtrl.f32VdPiOut;
+        g_stVFCtrl.f32VqRef = g_stVFCtrl.f32VqPiOut;
         break;
     }
 
@@ -587,6 +862,11 @@ void VF_ControlStep(void)
     TIM1->CCR1 = g_stVFCtrl.u16Ta;
     TIM1->CCR2 = g_stVFCtrl.u16Tb;
     TIM1->CCR3 = g_stVFCtrl.u16Tc;
+
+    /*======================================================================*/
+    /* 龙伯格观测器（旁路诊断，不影响控制）                                  */
+    /*======================================================================*/
+    VF_LuenbergerRun();
 
     /*======================================================================*/
     /* 运行计数                                                              */

@@ -123,19 +123,57 @@ extern "C" {
 /** @brief VF→IF blend 过渡帧数 */
 #define VF_IF_BLEND_FRAMES              20000U  /* 2s @ 10kHz */
 
-/** @brief IF 电流目标 (pu) — αβ 电流幅值 */
-#define VF_IF_I_TARGET_PU               0.15f   /* 1.5A */
+/** @brief IF 电流目标 (pu) — q 轴电流 */
+#define VF_IF_IQ_TARGET_PU              0.15f   /* 1.5A */
 
-/** @brief IF PI 增益（单 PI 控 αβ 幅值） */
+/** @brief IF_RUNNING 保持时间 (帧) — 电流环稳定后再加速 */
+#define VF_IF_HOLD_FRAMES               20000U  /* 2s @ 10kHz */
+
+/** @brief IF 开环稳定后切观测角的等待帧数 */
+#define VF_OBS_SWITCH_DELAY             50000U  /* 5s @ 10kHz */
+
+/** @brief 开环角度到观测角度渐进切换帧数 */
+#define VF_OBS_TRANSITION_FRAMES        5000U   /* 500ms @ 10kHz */
+
+/** @brief IF 加速度 (RPM/s) */
+#define VF_IF_ACCEL_RPM_PER_SEC         50.0f
+
+/** @brief IF 加速目标转速 (RPM) */
+#define VF_IF_TARGET_RPM                300.0f
+
+/** @brief IF dq 电流环 PI 增益 */
 #define VF_IF_PI_KP                     0.02f
-#define VF_IF_PI_KI                     0.0002f
+#define VF_IF_PI_KI                     0.0005f
 
-/** @brief IF PI 输出限幅 (pu) */
+/** @brief IF dq 电流环 PI 修正限幅 (pu) */
+#define VF_IF_PI_CORRECTION_MAX         0.15f
+
+/** @brief IF dq 电流环 Vq PI 输出限幅 (pu) */
 #define VF_IF_PI_OUT_MAX                0.85f
 #define VF_IF_PI_OUT_MIN                (-VF_IF_PI_OUT_MAX)
 
 /** @brief IF 过流保护阈值 (pu) — 暂提高避免切换毛刺误触发 */
 #define VF_IF_OC_LIMIT_PU               1.5f    /* 15A */
+
+/*--- Luenberger BEMF observer / PLL parameters（仅观测，不参与控制）---*/
+#define VF_OBS_MAX_SPEED_RPM            7400.0f
+#define VF_OBS_MAX_OMEGA_ELEC           (VF_OBS_MAX_SPEED_RPM * VF_2PI \
+                                         * (float)MOTOR_POLE_PAIRS / 60.0f)
+#define VF_OBS_ELEC_OMEGA_TO_RPM        (60.0f / (VF_2PI * (float)MOTOR_POLE_PAIRS))
+#define VF_OBS_RS_PU                    (MOTOR_PHASE_RESISTANCE * 10.0f \
+                                         / VF_BASE_VOLTAGE_V)
+#define VF_OBS_LS_OVER_TS_PU            (MOTOR_PHASE_INDUCTANCE * 10.0f \
+                                         / (VF_BASE_VOLTAGE_V * VF_CTRL_TS))
+#define VF_OBS_CURRENT_GAIN             0.20f
+#define VF_OBS_BEMF_GAIN                0.002f
+#define VF_OBS_BEMF_LPF_GAIN            0.25f
+#define VF_OBS_PLL_KP                   20.0f
+#define VF_OBS_PLL_KI                   300.0f
+#define VF_OBS_PLL_SPEED_BLEND          0.002f
+#define VF_OBS_PLL_ERR_MAX              0.25f
+#define VF_OBS_MIN_BEMF_PU              0.01f
+#define VF_OBS_LOCK_BEMF_SQ_THR         0.0004f
+#define VF_OBS_LOCK_SPEED_RPM           150.0f
 
 /** @brief 对齐占空比 (50%=中点) */
 #define PWM_HALF_CYCLE_VF               (17000U / 4U)
@@ -153,7 +191,9 @@ typedef enum
     VF_STAGE_RUNNING   = 3,  /**< VF 恒速运行 */
     VF_STAGE_IF_BLEND  = 4,  /**< VF→IF 过渡 blend */
     VF_STAGE_IF_RUNNING= 5,  /**< IF 电流环闭环运行 */
-    VF_STAGE_FAULT     = 6   /**< 故障 */
+    VF_STAGE_OBS_TRANSITION = 6, /**< 开环角度渐进切换到观测角度 */
+    VF_STAGE_OBS_RUNNING = 7, /**< 观测角度 dq 电流环运行 */
+    VF_STAGE_FAULT     = 8   /**< 故障 */
 } VF_Stage;
 
 /**
@@ -170,6 +210,25 @@ typedef struct
     float fOutMax;
     float fOutMin;
 } VF_PI;
+
+/**
+  * @brief Luenberger 反电势观测器状态
+  */
+typedef struct
+{
+    float    f32IalphaHat;      /**< α 轴电流估计 (pu) */
+    float    f32IbetaHat;       /**< β 轴电流估计 (pu) */
+    float    f32Ealpha;         /**< α 轴反电势估计 (pu) */
+    float    f32Ebeta;          /**< β 轴反电势估计 (pu) */
+    float    f32ThetaObs;       /**< 观测电角度 (rad) */
+    float    f32SpeedObs;       /**< 观测机械转速 (RPM) */
+    float    f32OmegaElec;      /**< 观测电角速度 (rad/s) */
+    float    f32ErrAlpha;       /**< α 轴电流估计误差 (pu) */
+    float    f32ErrBeta;        /**< β 轴电流估计误差 (pu) */
+    float    f32ErrPll;         /**< PLL 相位误差 */
+    float    f32BemfMag;        /**< BEMF 幅值 (pu) */
+    uint16_t u16Locked;         /**< 锁定标志 */
+} VF_Luenberger;
 
 /**
   * @brief VF 控制状态结构体
@@ -201,12 +260,25 @@ typedef struct
     /*--- VF→IF 切换状态 ---*/
     uint32_t  u32VfRunCount;    /**< VF_RUNNING 运行帧数 */
     uint32_t  u32IfBlendCount;  /**< IF blend 计数器 */
+    uint32_t  u32IfRunCount;    /**< IF_RUNNING 运行帧数 */
+    uint32_t  u32ObsBlendCount; /**< 观测角切换计数器 */
     float     f32IfBlendVqStart;/**< blend 起始 Vq (V/f 值) */
+    float     f32ThetaErrSave;  /**< 过渡开始时 θobs - θopen 的带符号误差 */
+    float     f32ThetaOpenRef;  /**< 过渡开始时开环角度 */
+    float     f32ThetaOpen;     /**< 纯开环积分角度备份 */
 
-    /*--- IF 电流环状态（单 PI 控 αβ 电流幅值，不依赖 Park）---*/
-    float     f32IfITarget;     /**< αβ 电流幅值目标 (pu) */
-    VF_PI     stPiMag;          /**< αβ 电流幅值 PI */
-    float     f32PiMagOut;      /**< PI 输出 (pu) */
+    /*--- IF dq 电流环状态 ---*/
+    float     f32IfITarget;     /**< 电流幅值目标 (pu)，供遥测 */
+    float     f32IdTarget;      /**< d 轴电流目标 (pu) */
+    float     f32IqTarget;      /**< q 轴电流目标 (pu) */
+    VF_PI     stPiD;            /**< d 轴电流 PI */
+    VF_PI     stPiQ;            /**< q 轴电流 PI */
+    float     f32VdPiOut;       /**< d 轴 PI 输出 (pu) */
+    float     f32VqPiOut;       /**< q 轴 PI 输出 (pu) */
+
+    /*--- dq 电流反馈 ---*/
+    float     f32Id;            /**< d 轴电流反馈 (pu) */
+    float     f32Iq;            /**< q 轴电流反馈 (pu) */
 
     /*--- 电流监控 ---*/
     float     f32Ia;            /**< A 相电流 (pu) */
@@ -218,6 +290,8 @@ typedef struct
     /*--- 诊断 ---*/
     float     f32VfOutputPu;    /**< V/f 曲线输出电压 (pu) */
     float     f32FreqHz;        /**< 当前电频率 (Hz) */
+
+    VF_Luenberger stObs;        /**< Luenberger 反电势观测器 */
 } VF_ControlState;
 
 /* Exported variables --------------------------------------------------------*/
@@ -228,6 +302,7 @@ extern VF_ControlState g_stVFCtrl;
 
 void  VF_Init(void);
 void  VF_SetTargetRpm(float fTargetRpm);
+void  VF_SetTargetRpm(float fTargetRpm);
 void  VF_SetAccel(float fAccelRpmPerSec);
 void  VF_Stop(void);
 void  VF_ControlStep(void);
@@ -236,6 +311,8 @@ void  VF_Svpwm(float fValpha, float fVbeta,
 void  VF_InvPark(float fVd, float fVq, float fTheta,
                  float *pfValpha, float *pfVbeta);
 void  VF_GetPhaseCurrent(void);
+void  VF_LuenbergerInit(void);
+void  VF_LuenbergerRun(void);
 
 #ifdef __cplusplus
 }

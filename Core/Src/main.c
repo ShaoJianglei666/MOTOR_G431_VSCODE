@@ -301,71 +301,57 @@ static void VOFA_SendTelemetry(void)
     char buf[256];
     int pos = 0;
     float theta_deg = VOFA_RadToDeg(g_stVFCtrl.f32Theta);
+    float theta_obs_deg = VOFA_RadToDeg(g_stVFCtrl.stObs.f32ThetaObs);
+    float theta_err_deg = VOFA_WrapDeg180(theta_obs_deg - theta_deg);
 
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "vf:");
 
-    /* 目标转速 (RPM) */
+    /* 1. 目标转速 (RPM) */
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32TargetRpm);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* 当前斜坡转速 (RPM) */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32CurrentRpm);
+    /* 2. id_ref (pu) — IF 模式下恒为 0 */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), 0.0f);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* 电角度 (deg) */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_deg);
+    /* 3. iq_ref (pu) — 电流幅值目标 */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32IfITarget);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* Vd 指令 (pu) */
+    /* 4. id (pu) — Park 变换诊断值 */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32Id);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 5. iq (pu) — Park 变换诊断值 */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32Iq);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 6. ud (pu) */
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32VdRef);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* Vq 指令 (pu) */
+    /* 7. uq (pu) */
     pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32VqRef);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* V/f 输出电压 (pu) */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32VfOutputPu);
+    /* 8. 生成电角度 (deg) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_deg);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* 电频率 (Hz) */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32FreqHz);
+    /* 9. 观测器电角度 (deg) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_obs_deg);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* 运行帧数 */
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32RunFrames);
+    /* 10. 角度误差 (deg) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), theta_err_deg);
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
 
-    /* 阶段码 */
+    /* 11. 观测器速度 (RPM) */
+    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.stObs.f32SpeedObs);
+    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
+
+    /* 12. 目前阶段 */
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)g_stVFCtrl.eStage);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-
-    /* 相电流 (pu) */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32Ia);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32Ib);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-
-    /* 电流矢量幅值 (pu) */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32CurrentMag);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-
-    /* IF 目标电流 / PI 输出 */
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32IfITarget);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos = VOFA_AppendMilli(buf, pos, sizeof(buf), g_stVFCtrl.f32PiMagOut);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-
-    /* blend / VF run 计数 */
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32IfBlendCount);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%lu", (unsigned long)g_stVFCtrl.u32VfRunCount);
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-
-    /* ADC 原始值 */
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)(ADC1->JDR1));
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, ",");
-    pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "%u", (unsigned int)(ADC2->JDR1));
     pos += snprintf(&buf[pos], sizeof(buf) - (size_t)pos, "\n");
 
     if ((pos > 0) && (pos < (int)sizeof(buf)))
